@@ -302,6 +302,7 @@ export const config: NodelinkConfig = {
       hl: 'en',
       gl: 'US',
       proxies: [],
+      mirrorOfficialAlbums: false,
       fallbackSources: [
         'soundcloud',
         'deezer',
@@ -321,6 +322,7 @@ export const config: NodelinkConfig = {
       clients: {
         search: ['Android'],
         playback: [
+          'VisionOs',
           'AndroidVR',
           'TV_DOWN',
           'TV',
@@ -331,6 +333,7 @@ export const config: NodelinkConfig = {
           'IOS'
         ],
         resolve: [
+          'VisionOs',
           'AndroidVR',
           'TV_DOWN',
           'TV',
@@ -627,6 +630,10 @@ export const config: NodelinkConfig = {
       enabled: true
     },
 
+    newgrounds: {
+      enabled: true
+    },
+
     soundcloud: {
       enabled: true,
       clientId: ''
@@ -732,6 +739,7 @@ export const config: NodelinkConfig = {
 
   lyrics: {
     fallbackSource: 'genius',
+    preferredSources: [],
     youtube: {
       enabled: true
     },
@@ -784,6 +792,10 @@ export const config: NodelinkConfig = {
     defaultVolume: 0.8,
     maxLayersMix: 5,
     autoCleanup: true
+  },
+
+  cache: {
+    diskEnabled: true
   },
 
   plugins: [],

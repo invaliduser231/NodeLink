@@ -1,6 +1,6 @@
 import { PassThrough } from 'node:stream';
 import HLSHandler from '../../playback/hls/HLSHandler.js';
-import { getBestMatch, http1makeRequest, logger, makeRequest } from '../../utils.js';
+import { encodeTrack, getBestMatch, http1makeRequest, logger, makeRequest } from '../../utils.js';
 import CipherManager from './CipherManager.js';
 import { checkURLType, YOUTUBE_CONSTANTS } from './common.js';
 import YouTubeLiveChat from './LiveChat.js';
@@ -241,7 +241,7 @@ export default class YouTubeSource {
     async setup() {
         logger('info', 'YouTube', 'Setting up YouTube source...');
         this.oauth = new OAuth(this.nodelink);
-        const [{ default: Android }, { default: AndroidVR }, { default: IOS }, { default: Music }, { default: WebRemix }, { default: TV }, { default: TV_DOWN }, { default: TVCast }, { default: Web }, { default: WebEmbedded }] = await Promise.all([
+        const [{ default: Android }, { default: AndroidVR }, { default: IOS }, { default: Music }, { default: WebRemix }, { default: TV }, { default: TV_DOWN }, { default: TVCast }, { default: Web }, { default: WebEmbedded }, { default: VisionOs }] = await Promise.all([
             import('./clients/Android.js'),
             import('./clients/AndroidVR.js'),
             import('./clients/IOS.js'),
@@ -251,7 +251,8 @@ export default class YouTubeSource {
             import('./clients/TV_downgraded.js'),
             import('./clients/TVCast.js'),
             import('./clients/Web.js'),
-            import('./clients/WebEmbedded.js')
+            import('./clients/WebEmbedded.js'),
+            import('./clients/visionOs.js')
         ]);
         const clientClasses = {
             Android,
@@ -263,7 +264,8 @@ export default class YouTubeSource {
             TV_DOWN,
             TVCast,
             Web,
-            WebEmbedded
+            WebEmbedded,
+            VisionOs
         };
         for (const clientName of Object.keys(clientClasses)) {
             const ClientCtor = clientClasses[clientName];
@@ -318,6 +320,9 @@ export default class YouTubeSource {
      * @returns Promise that resolves when the fetch attempt completes.
      */
     async _fetchVisitorData() {
+        // this should prevent the visitorData getting initialized twice.
+        if (process.env.WORKER_TYPE === 'source')
+            return;
         const cachedPlayerScript = this.nodelink.credentialManager?.get('yt_player_script_url');
         if (cachedPlayerScript) {
             this.cipherManager.setPlayerScriptUrl(cachedPlayerScript);
@@ -326,54 +331,79 @@ export default class YouTubeSource {
         let visitorFound = false;
         let playerScriptUrl = null;
         try {
-            const { body: data, error, statusCode } = await makeRequest('https://www.youtube.com/embed', {
-                method: 'GET',
-                headers: {
-                    Cookie: 'YSC=LUAfwHpna4E; VISITOR_INFO1_LIVE=Zuih2uZbq3I;'
-                }
-            });
-            if (!error && statusCode === 200) {
-                const bodyStr = data;
-                const visitorMatch = bodyStr?.match(/"VISITOR_DATA":"([^"]+)"/);
-                if (visitorMatch?.[1]) {
-                    this.ytContext.client.visitorData = visitorMatch[1];
-                    visitorFound = true;
-                    logger('debug', 'YouTube', 'visitorData refreshed from embed.');
-                }
-                if (!cachedPlayerScript) {
-                    const playerScriptMatch = bodyStr?.match(/"jsUrl":"([^"]+)"/);
-                    if (playerScriptMatch?.[1]) {
-                        playerScriptUrl = playerScriptMatch[1].replace(/\/[a-z]{2}_[A-Z]{2}\//, '/en_US/');
-                        this.nodelink.credentialManager?.set('yt_player_script_url', playerScriptUrl, 12 * 60 * 60 * 1000);
-                        logger('debug', 'YouTube', `Player script URL: ${playerScriptUrl}`);
+            const { body, error, statusCode } = await makeRequest('https://youtubei.googleapis.com/youtubei/v1/visitor_id?key=AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w', {
+                method: 'POST',
+                body: {
+                    context: {
+                        client: {
+                            clientName: 'ANDROID',
+                            clientVersion: '20.01.35'
+                        }
                     }
-                }
-            }
-            else {
-                logger('warn', 'YouTube', `Embed request failed: ${error?.message || `Status ${statusCode}`}`);
-            }
-            if (!visitorFound) {
-                const { body: guideData, error: guideError, statusCode: guideStatusCode } = await makeRequest('https://www.youtube.com/youtubei/v1/guide', {
-                    method: 'POST',
-                    body: { context: this.ytContext },
-                    disableBodyCompression: true
-                });
-                const guideBody = guideData;
-                if (!guideError &&
-                    guideStatusCode === 200 &&
-                    guideBody?.responseContext?.visitorData) {
-                    this.ytContext.client.visitorData =
-                        guideBody.responseContext.visitorData;
-                    visitorFound = true;
-                    logger('debug', 'YouTube', 'visitorData refreshed via guide.');
-                }
-                else {
-                    logger('warn', 'YouTube', 'Failed to refresh visitorData via guide.');
-                }
+                },
+                disableBodyCompression: true
+            });
+            const data = body;
+            if (!error && statusCode === 200 && data?.responseContext?.visitorData) {
+                this.ytContext.client.visitorData = data.responseContext.visitorData;
+                visitorFound = true;
+                logger('debug', 'YouTube', `visitorData obtained from visitor_id endpoint (len=${data.responseContext.visitorData.length})`);
             }
         }
         catch (e) {
-            logger('error', 'YouTube', `Error fetching visitor data: ${e.message}`);
+            logger('debug', 'YouTube', `visitor_id endpoint failed: ${e.message}`);
+        }
+        if (!visitorFound) {
+            try {
+                const { body: data, error, statusCode } = await makeRequest('https://www.youtube.com/embed', {
+                    method: 'GET',
+                    headers: {
+                        Cookie: 'YSC=LUAfwHpna4E; VISITOR_INFO1_LIVE=Zuih2uZbq3I;'
+                    }
+                });
+                if (!error && statusCode === 200) {
+                    const bodyStr = data;
+                    const visitorMatch = bodyStr?.match(/"VISITOR_DATA":"([^"]+)"/);
+                    if (visitorMatch?.[1]) {
+                        this.ytContext.client.visitorData = visitorMatch[1];
+                        visitorFound = true;
+                        logger('debug', 'YouTube', 'visitorData refreshed from embed.');
+                    }
+                    if (!cachedPlayerScript) {
+                        const playerScriptMatch = bodyStr?.match(/"jsUrl":"([^"]+)"/);
+                        if (playerScriptMatch?.[1]) {
+                            playerScriptUrl = playerScriptMatch[1].replace(/\/[a-z]{2}_[A-Z]{2}\//, '/en_US/');
+                            this.nodelink.credentialManager?.set('yt_player_script_url', playerScriptUrl, 12 * 60 * 60 * 1000);
+                            logger('debug', 'YouTube', `Player script URL: ${playerScriptUrl}`);
+                        }
+                    }
+                }
+                else {
+                    logger('warn', 'YouTube', `Embed request failed: ${error?.message || `Status ${statusCode}`}`);
+                }
+                if (!visitorFound) {
+                    const { body: guideData, error: guideError, statusCode: guideStatusCode } = await makeRequest('https://www.youtube.com/youtubei/v1/guide', {
+                        method: 'POST',
+                        body: { context: this.ytContext },
+                        disableBodyCompression: true
+                    });
+                    const guideBody = guideData;
+                    if (!guideError &&
+                        guideStatusCode === 200 &&
+                        guideBody?.responseContext?.visitorData) {
+                        this.ytContext.client.visitorData =
+                            guideBody.responseContext.visitorData;
+                        visitorFound = true;
+                        logger('debug', 'YouTube', 'visitorData refreshed via guide.');
+                    }
+                    else {
+                        logger('warn', 'YouTube', 'Failed to refresh visitorData via guide.');
+                    }
+                }
+            }
+            catch (e) {
+                logger('error', 'YouTube', `Error fetching visitor data: ${e.message}`);
+            }
         }
         if (playerScriptUrl)
             this.cipherManager.setPlayerScriptUrl(playerScriptUrl);
@@ -519,6 +549,29 @@ export default class YouTubeSource {
      * @returns Promise resolving to a source result with track/playlist data or an exception.
      */
     async resolve(url, type) {
+        const result = await this._resolveWorker(url, type);
+        if (this.config.mirrorOfficialAlbums &&
+            url.includes('list=OLAK') &&
+            result.loadType === 'playlist') {
+            const tracks = result.data
+                ?.tracks;
+            if (tracks) {
+                for (const track of tracks) {
+                    if (track.info && !track.info.uri.includes('olak=true')) {
+                        const separator = track.info.uri.includes('?') ? '&' : '?';
+                        track.info.uri += `${separator}olak=true`;
+                        track.encoded = encodeTrack({ ...track.info, details: [] });
+                    }
+                }
+            }
+        }
+        return result;
+    }
+    /**
+     * Internal worker for URL resolution.
+     * @internal
+     */
+    async _resolveWorker(url, type) {
         const liveMatch = url.match(/^https?:\/\/(?:www\.)?youtube\.com\/live\/([\w-]+)/);
         if (liveMatch) {
             const videoId = liveMatch[1];
@@ -745,6 +798,40 @@ export default class YouTubeSource {
      * @returns Promise resolving to track URL data with stream info or an exception.
      */
     async getTrackUrl(decodedTrack, itag, forceRefresh = false) {
+        if (decodedTrack.uri?.includes('olak=true')) {
+            logger('debug', 'YouTube', `Resolving mirrored audio track for official album: ${decodedTrack.identifier}`);
+            let searchTitle = decodedTrack.title;
+            let searchAuthor = decodedTrack.author;
+            if (searchTitle.includes(' - ')) {
+                const parts = searchTitle.split(' - ');
+                if (parts[0] && parts.length > 1) {
+                    searchAuthor = parts[0].trim();
+                    searchTitle = parts.slice(1).join(' - ').trim();
+                }
+            }
+            const query = `${searchAuthor} ${searchTitle}`;
+            const searchTrack = { ...decodedTrack, title: searchTitle, author: searchAuthor };
+            try {
+                const res = await this.search(query, 'ytmsearch');
+                if (res.loadType === 'search' && res.data.length) {
+                    const best = getBestMatch(res.data, searchTrack);
+                    if (best) {
+                        const urlData = await this.getTrackUrl(best.info, itag, forceRefresh);
+                        return {
+                            newTrack: { info: best.info },
+                            url: urlData.url,
+                            protocol: urlData.protocol,
+                            format: typeof urlData.format === 'string' ? urlData.format : undefined,
+                            additionalData: urlData.additionalData,
+                            exception: urlData.exception
+                        };
+                    }
+                }
+            }
+            catch (e) {
+                logger('warn', 'YouTube', `Failed to mirror OLAK track ${decodedTrack.identifier}: ${e.message}`);
+            }
+        }
         if (!forceRefresh) {
             const cached = this.nodelink.trackCacheManager?.get('youtube', decodedTrack.identifier);
             if (cached) {
@@ -1010,8 +1097,8 @@ export default class YouTubeSource {
                 !blockedFallbackSources.has(name) &&
                 sourcesConfig[name]?.enabled &&
                 source &&
-                typeof source.search === 'function' &&
-                typeof source.getTrackUrl === 'function');
+                !!source.search &&
+                !!source.getTrackUrl);
         });
         if (fallbackOrder.length === 0)
             return null;

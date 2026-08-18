@@ -496,14 +496,14 @@ class NodelinkServer extends EventEmitter {
             for (const session of this.sessions.activeSessions.values()) {
                 if (session.socket && !session.isPaused) {
                     try {
-                        if (typeof session.socket.sendFrame === 'function') {
+                        if (session.socket.sendFrame) {
                             session.socket.sendFrame(Buffer.alloc(0), {
                                 len: 0,
                                 fin: true,
                                 opcode: 0x09
                             });
                         }
-                        else if (typeof session.socket.ping === 'function') {
+                        else if (session.socket.ping) {
                             session.socket.ping();
                         }
                     }
@@ -914,7 +914,7 @@ class NodelinkServer extends EventEmitter {
                     return;
                 }
                 const liveChatFn = yt.handleLiveChat;
-                if (typeof liveChatFn === 'function') {
+                if (liveChatFn) {
                     liveChatFn.call(yt, socket, videoId);
                 }
                 else {
@@ -1203,7 +1203,8 @@ class NodelinkServer extends EventEmitter {
                     continue;
                 for (const player of session.players.players.values()) {
                     if (player?.track && !player.isPaused && player.connection) {
-                        if (player._lastStreamDataTime > 0 &&
+                        if (player.connStatus === 'connected' &&
+                            player._lastStreamDataTime > 0 &&
                             Date.now() - player._lastStreamDataTime >= zombieThreshold) {
                             logger('warn', 'Player', `Player for guild ${player.guildId} detected as zombie (no stream data).`);
                             player.emitEvent(GatewayEvents.TRACK_STUCK, {

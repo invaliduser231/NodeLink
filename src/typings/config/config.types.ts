@@ -162,6 +162,9 @@ export interface YouTubeSourceConfig {
    * Allow additional unknown configuration keys.
    */
   [key: string]: unknown
+
+  /** When true, official albums (OLAK) are resolved via an internal audio-only mirror search to ensure gapless playback. */
+  mirrorOfficialAlbums?: boolean
 }
 
 /**
@@ -833,6 +836,9 @@ export interface SourcesRegistry {
   /** Bandcamp resolution. */
   bandcamp: FeatureToggle
 
+  /** Newgrounds Audio Portal resolution. */
+  newgrounds: FeatureToggle
+
   /** SoundCloud resolution. */
   soundcloud: FeatureToggle & {
     /** Optional SoundCloud API Client ID. */
@@ -1272,6 +1278,8 @@ export interface NodelinkConfig {
   /** Lyrics extraction settings. */
   lyrics: {
     fallbackSource: string
+    /** Ordered lyrics providers tried after the track's native provider. */
+    preferredSources?: string[]
     [source: string]: unknown
   }
 
@@ -1304,6 +1312,11 @@ export interface NodelinkConfig {
     source: string
     path?: string
   }>
+
+  /** Configuration for disk caching. */
+  cache?: {
+    diskEnabled?: boolean
+  }
 
   /** Passthrough addon settings. */
   pluginConfig: Record<string, Record<string, unknown>>

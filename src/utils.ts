@@ -82,7 +82,7 @@ const getProxyAgent = async (): Promise<ProxyAgentConstructor | null> => {
       (mod as { default?: unknown }).default
 
     ProxyAgent =
-      typeof candidate === 'function'
+      candidate instanceof Function
         ? (candidate as ProxyAgentConstructor)
         : null
   } catch {
@@ -636,7 +636,7 @@ function getGitInfo(): GitInfo {
     let branch = 'unknown'
     const headMatch = refsLine.match(/HEAD -> ([^,]+)/)
     if (headMatch) {
-      branch = headMatch[1]!.trim()
+      branch = headMatch[1]?.trim() ?? 'unknown'
     } else {
       try {
         branch = execSync('git rev-parse --abbrev-ref HEAD', {
@@ -2195,8 +2195,40 @@ async function checkDependencyUpdates(
         fs.existsSync(path.resolve(process.cwd(), 'bun.lock'))
       const isPnpm =
         fs.existsSync(path.resolve(process.cwd(), 'pnpm-lock.yaml')) && !isBun
-      const cmd = isPnpm ? 'pnpm update' : isBun ? 'bun update' : 'npm update'
+      const pkgTargets = updates.map((u) => `"${u.name}@^${u.latest}"`).join(' ')
+      const cmd = isPnpm
+        ? `pnpm add ${pkgTargets}`
+        : isBun
+          ? `bun add ${pkgTargets}`
+          : `npm install ${pkgTargets} --save`
+
       execSync(cmd, { stdio: 'inherit' })
+
+      // Verify that installed version actually changed to prevent infinite reboot loops
+      const versionChanged = updates.some((update) => {
+        try {
+          const depPath = path.join(
+            process.cwd(),
+            'node_modules',
+            update.name,
+            'package.json'
+          )
+          const newVer = JSON.parse(fs.readFileSync(depPath, 'utf8')).version
+          return newVer !== update.current
+        } catch {
+          return false
+        }
+      })
+
+      if (!versionChanged) {
+        logger(
+          'warn',
+          'Server',
+          'Dependency update did not change installed version. Skipping automatic restart to prevent boot loop.'
+        )
+        return
+      }
+
       logger(
         'info',
         'Server',
@@ -2240,7 +2272,9 @@ async function checkForUpdates(): Promise<void> {
     const util = await import('node:util')
     const execAsync = util.promisify(exec)
 
-    await execAsync('git fetch', { stdio: 'ignore' } as any)
+    await execAsync('git fetch', {
+      stdio: 'ignore'
+    } as import('node:child_process').ExecOptions)
 
     const { stdout: local } = await execAsync('git rev-parse HEAD', {
       encoding: 'utf8'

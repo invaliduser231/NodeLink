@@ -11,7 +11,6 @@ import type {
   YouTubeContext
 } from '../../../typings/sources/youtube.types.ts'
 import type {
-  YouTubeNextRequestBody,
   YouTubeNextResponse,
   YouTubeSearchResponse
 } from '../../../typings/sources/youtubeClient.types.ts'
@@ -103,9 +102,9 @@ export default class Android extends BaseClient {
   ): Promise<SourceResult> {
     const sourceName = 'youtube'
 
-    let params = 'EgIQAQ%3D%3D' // Default to track (video)
-    if (type === 'playlist' || type === 'album') params = 'EgIQAw%3D%3D'
-    if (type === 'artist' || type === 'channel') params = 'EgIQAg%3D%3D'
+    let params = 'oAIBEgIQAQ%3D%3D' // Default to track (video)
+    if (type === 'playlist' || type === 'album') params = 'oAIBEgIQAw%3D%3D'
+    if (type === 'artist' || type === 'channel') params = 'oAIBEgIQAg%3D%3D'
 
     const requestBody = {
       context: this.getClient(context),
@@ -374,6 +373,7 @@ export default class Android extends BaseClient {
         const playlistId = playlistIdMatch[1]
         const videoIdMatch = url.match(/[?&]v=([\w-]+)/)
         const currentVideoId = videoIdMatch?.[1] ?? null
+        const isRadio = playlistId.startsWith('RD')
 
         logger(
           'debug',
@@ -381,20 +381,22 @@ export default class Android extends BaseClient {
           `User-Agent for playlist request: ${this.getClient(context).client.userAgent}`
         )
 
-        const requestBody: YouTubeNextRequestBody = {
-          context: this.getClient(context),
-          playlistId,
-          contentCheckOk: true,
-          racyCheckOk: true
-        }
-        if (playlistId.startsWith('RD') && currentVideoId) {
+        const requestBody: Record<string, unknown> = isRadio
+          ? {
+              context: this.getClient(context),
+              playlistId,
+              contentCheckOk: true,
+              racyCheckOk: true
+            }
+          : { context: this.getClient(context), browseId: `VL${playlistId}` }
+        if (isRadio && currentVideoId) {
           requestBody.videoId = currentVideoId
         }
 
         const playlistProxy = this.getProxy()
         const playlistStart = Date.now()
         const { body: playlistResponseRaw, statusCode } = await makeRequest(
-          `${apiEndpoint}/youtubei/v1/next`,
+          `${apiEndpoint}/youtubei/v1/${isRadio ? 'next' : 'browse'}`,
           {
             headers: {
               'User-Agent': this.getClient(context).client.userAgent,
@@ -437,6 +439,15 @@ export default class Android extends BaseClient {
         }
 
         const playlistResponse = playlistResponseRaw as YouTubeNextResponse
+
+        if (!isRadio) {
+          return await this._handleBrowsePlaylistResponse(
+            playlistId,
+            playlistResponse,
+            sourceName,
+            context
+          )
+        }
 
         return await this._handlePlaylistResponse(
           playlistId,

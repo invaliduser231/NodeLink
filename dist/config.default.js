@@ -288,6 +288,7 @@ export const config = {
             hl: 'en',
             gl: 'US',
             proxies: [],
+            mirrorOfficialAlbums: false,
             fallbackSources: [
                 'soundcloud',
                 'deezer',
@@ -307,6 +308,7 @@ export const config = {
             clients: {
                 search: ['Android'],
                 playback: [
+                    'VisionOs',
                     'AndroidVR',
                     'TV_DOWN',
                     'TV',
@@ -317,6 +319,7 @@ export const config = {
                     'IOS'
                 ],
                 resolve: [
+                    'VisionOs',
                     'AndroidVR',
                     'TV_DOWN',
                     'TV',
@@ -587,6 +590,9 @@ export const config = {
         bandcamp: {
             enabled: true
         },
+        newgrounds: {
+            enabled: true
+        },
         soundcloud: {
             enabled: true,
             clientId: ''
@@ -670,6 +676,7 @@ export const config = {
     },
     lyrics: {
         fallbackSource: 'genius',
+        preferredSources: [],
         youtube: {
             enabled: true
         },
@@ -719,6 +726,9 @@ export const config = {
         defaultVolume: 0.8,
         maxLayersMix: 5,
         autoCleanup: true
+    },
+    cache: {
+        diskEnabled: true
     },
     plugins: [],
     pluginConfig: {}

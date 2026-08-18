@@ -545,6 +545,11 @@ export interface Player {
   connection: VoiceConnection | null
 
   /**
+   * Current Discord voice connection status
+   */
+  connStatus: 'connecting' | 'connected' | 'disconnected' | 'destroyed'
+
+  /**
    * Last time stream data was received
    * @internal
    */
@@ -897,6 +902,11 @@ export interface Session {
    * Player manager for this session
    */
   players: PlayerManagerInstance
+
+  /**
+   * Group manager for multi-guild player synchronization
+   */
+  groups: import('../managers/groupManager.ts').default
 
   /**
    * Event queue for reconnection
@@ -1267,6 +1277,9 @@ export interface ConnectionManagerContext {
       socket: {
         send: (data: string | Buffer) => boolean
       } | null
+      players: {
+        players: Map<string, { guildId: string }>
+      }
     }>
   }
 }

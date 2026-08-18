@@ -60,12 +60,21 @@ import { ScratchTransformer } from './ScratchTransformer.ts'
 import { FlowController } from './FlowController.ts'
 import { FiltersManager } from './filtersManager.ts'
 import { VolumeTransformer } from './VolumeTransformer.ts'
+import {
+  CrossfadeController,
+  type CrossfadePrepareOptions
+} from './CrossfadeController.ts'
 import { SilenceDetector } from './SilenceDetector.ts'
 
 type LibSampleRateModule = typeof import('@alexanderolsen/libsamplerate-js')
 let libSampleRatePromise: Promise<LibSampleRateModule> | null = null
 
 type MP4BoxModule = typeof import('mp4box')
+type MP4Descriptor = {
+  tag?: number
+  data?: Uint8Array
+  descs?: MP4Descriptor[]
+}
 let mp4BoxPromise: Promise<MP4BoxModule> | null = null
 
 const getMP4Box = async (): Promise<MP4BoxModule> => {
@@ -137,6 +146,38 @@ const SAMPLE_RATES: readonly number[] = Object.freeze([
   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025,
   8000, 7350
 ])
+
+const _parseAacSampleRate = (data: Uint8Array): number | null => {
+  let bitOffset = 0
+  const readBits = (count: number): number | null => {
+    if (bitOffset + count > data.byteLength * 8) return null
+
+    let value = 0
+    for (let i = 0; i < count; i++) {
+      const byte = data[bitOffset >> 3]
+      if (byte === undefined) return null
+      value = (value << 1) | ((byte >> (7 - (bitOffset & 7))) & 1)
+      bitOffset++
+    }
+    return value
+  }
+
+  const objectType = readBits(5)
+  if (objectType === null) return null
+  if (objectType === 31 && readBits(6) === null) return null
+
+  const samplingIndex = readBits(4)
+  if (samplingIndex === null) return null
+
+  if (samplingIndex === 15) {
+    const explicitSampleRate = readBits(24)
+    return explicitSampleRate && explicitSampleRate > 0
+      ? explicitSampleRate
+      : null
+  }
+
+  return SAMPLE_RATES[samplingIndex] ?? null
+}
 
 const EMPTY_BUFFER: Buffer = Buffer.alloc(0)
 
@@ -695,7 +736,7 @@ class BaseAudioResource {
       _cleanupListeners?: () => void
     }
 
-    if (typeof firstPipe?._cleanupListeners === 'function') {
+    if (firstPipe?._cleanupListeners) {
       try {
         firstPipe._cleanupListeners()
       } catch {}
@@ -788,8 +829,65 @@ class BaseAudioResource {
 
   setLoudnessNormalizer(_enabled: boolean): void {}
 
+  prepareCrossfade(
+    stream: Readable,
+    options: CrossfadePrepareOptions,
+    onComplete: (consumedMs: number) => void
+  ): boolean {
+    const controller = this.pipes?.find(
+      (pipe) => pipe instanceof CrossfadeController
+    ) as CrossfadeController | undefined
+    return controller?.prepareNextStream(stream, options, onComplete) ?? false
+  }
+
+  startCrossfade(
+    durationMs?: number,
+    curve?: string,
+    availableMs?: number
+  ): boolean {
+    const controller = this.pipes?.find(
+      (pipe) => pipe instanceof CrossfadeController
+    ) as CrossfadeController | undefined
+    return controller?.startCrossfade(durationMs, curve, availableMs) ?? false
+  }
+
+  clearCrossfade(): void {
+    const controller = this.pipes?.find(
+      (pipe) => pipe instanceof CrossfadeController
+    ) as CrossfadeController | undefined
+    controller?.clearNext()
+  }
+
+  setCrossfadePaused(paused: boolean): void {
+    const controller = this.pipes?.find(
+      (pipe) => pipe instanceof CrossfadeController
+    ) as CrossfadeController | undefined
+    controller?.setPaused(paused)
+  }
+
+  getCrossfadeState(): {
+    active: boolean
+    bufferedMs: number
+    isBridging: boolean
+  } {
+    const controller = this.pipes?.find(
+      (pipe) => pipe instanceof CrossfadeController
+    ) as CrossfadeController | undefined
+    return (
+      controller?.getState() ?? {
+        active: false,
+        bufferedMs: 0,
+        isBridging: false
+      }
+    )
+  }
+
   isPipelineFinished(): boolean {
     if (this._destroyed || !this.pipes) return true
+    const crossfadeController = this.pipes.find(
+      (pipe) => pipe instanceof CrossfadeController
+    ) as CrossfadeController | undefined
+    if (crossfadeController?.getState().isBridging) return false
     for (const pipe of this.pipes) {
       if (
         (pipe as unknown as { isFinished?: boolean }).isFinished ||
@@ -1787,6 +1885,7 @@ class MP4ToAACStream extends Transform {
     this._prefetchDone = true
 
     const prefetch = this._opts.prefetch ?? []
+    this._opts.prefetch = undefined
     for (const chunk of prefetch) {
       const ab = chunk.data as ArrayBuffer & { fileStart?: number }
       ab.fileStart = chunk.fileStart
@@ -1830,6 +1929,7 @@ class MP4ToAACStream extends Transform {
         this.symphoniaDecoder.write(reordered)
       } else {
         this.audioConfig = this._getAudioConfig(audioTrack)
+        this.headerChunks = []
 
         this.mp4boxFile.setExtractionOptions(audioTrack.id, null, {
           nbSamples: 50
@@ -1907,7 +2007,34 @@ class MP4ToAACStream extends Transform {
 
   _getAudioConfig(track: MP4BoxTrack): AACConfig {
     let profile = 2
-    let adtsSampleRate = track.audio.sample_rate
+    const file = this.mp4boxFile as unknown as {
+      getTrackById?: (id: number) => {
+        mdia?: {
+          minf?: {
+            stbl?: {
+              stsd?: {
+                entries?: Array<{
+                  esds?: {
+                    esd?: { descs?: MP4Descriptor[] }
+                  }
+                }>
+              }
+            }
+          }
+        }
+      }
+    }
+    const entry = file?.getTrackById?.(track.id)?.mdia?.minf?.stbl?.stsd
+      ?.entries?.[0]
+    const decoderConfig = entry?.esds?.esd?.descs?.find(
+      (descriptor) => descriptor.tag === 4
+    )
+    const decoderSpecificInfo = decoderConfig?.descs?.find(
+      (descriptor) => descriptor.tag === 5
+    )?.data
+    const adtsSampleRate =
+      (decoderSpecificInfo && _parseAacSampleRate(decoderSpecificInfo)) ||
+      track.audio.sample_rate
 
     if (track.codec) {
       const codecParts = (String(track.codec) || '').split('.')
@@ -1916,13 +2043,9 @@ class MP4ToAACStream extends Transform {
         const objectType = Number.parseInt(codecParts[2] || '0', 10)
 
         if (objectType === 5 || objectType === 29) {
-          // HE-AAC/HE-AACv2 stores the output rate on the track, but ADTS must
-          // advertise the core AAC-LC rate (typically half of the output rate).
+          // ADTS carries the AAC-LC core profile. FAAD detects the SBR/PS
+          // extension from the payload and exposes the higher output rate.
           profile = 2
-          adtsSampleRate = Math.max(
-            SAMPLE_RATES[SAMPLE_RATES.length - 1] ?? 7350,
-            Math.floor(track.audio.sample_rate / 2)
-          )
         } else {
           profile = objectType
         }
@@ -1959,7 +2082,7 @@ class MP4ToAACStream extends Transform {
       return
     }
 
-    this.headerChunks.push(chunk)
+    if (!this.audioConfig) this.headerChunks.push(chunk)
 
     try {
       await this._initMp4Box()
@@ -2589,7 +2712,8 @@ class StreamAudioResource extends BaseAudioResource {
     volume = 1.0,
     audioMixer: AudioMixer | null = null,
     returnPCM = false,
-    enableAGC = true
+    enableAGC = true,
+    enableCrossfade = false
   ) {
     super(guildId)
 
@@ -2618,7 +2742,8 @@ class StreamAudioResource extends BaseAudioResource {
         initialFilters,
         volume,
         audioMixer,
-        enableAGC
+        enableAGC,
+        enableCrossfade
       )
     }
 
@@ -2800,7 +2925,8 @@ class StreamAudioResource extends BaseAudioResource {
     initialFilters: FiltersState,
     volume: number,
     audioMixer: AudioMixer | null = null,
-    enableAGC = true
+    enableAGC = true,
+    enableCrossfade = false
   ): void {
     const frameCounter = new PCMFrameCounter(
       AUDIO_CONFIG.sampleRate,
@@ -2853,13 +2979,22 @@ class StreamAudioResource extends BaseAudioResource {
 
     opusEncoder.setDTX(false)
 
-    const streams: Transform[] = [
-      pcmStream,
-      frameCounter,
-      silenceDetector,
-      filters,
-      flowController
-    ]
+    const streams: Transform[] = [pcmStream]
+    if (enableCrossfade) {
+      const crossfadeController = new CrossfadeController()
+      crossfadeController.on('bridgeStart', () => {
+        this.canStop = false
+      })
+      crossfadeController.on('bridgeEnd', () => {
+        if (this._destroyed) return
+        this.canStop = true
+        this._finishBufferingEmitted = true
+        this.stream?.emit('finishBuffering')
+      })
+      streams.push(crossfadeController)
+      this.pipes?.push(crossfadeController)
+    }
+    streams.push(frameCounter, silenceDetector, filters, flowController)
     this.pipes?.push(frameCounter, silenceDetector, filters, flowController)
 
     if (nodelink.extensions?.audioInterceptors) {
@@ -3006,6 +3141,7 @@ class StreamAudioResource extends BaseAudioResource {
 
   _setupEventHandlers(inputStream: Readable): void {
     const forwardFinishBuffering = (): void => {
+      if (this.getCrossfadeState().isBridging) return
       if (!this._destroyed) {
         this._finishBufferingEmitted = true
         this.stream?.emit('finishBuffering')
@@ -3071,7 +3207,8 @@ export const createAudioResource = (
   volume: number = 1.0,
   audioMixer: AudioMixer | null = null,
   returnPCM: boolean = false,
-  enableAGC: boolean = true
+  enableAGC: boolean = true,
+  enableCrossfade: boolean = false
 ): StreamAudioResource =>
   new StreamAudioResource(
     guildId,
@@ -3082,7 +3219,8 @@ export const createAudioResource = (
     volume,
     audioMixer,
     returnPCM,
-    enableAGC
+    enableAGC,
+    enableCrossfade
   )
 
 export const createSeekeableAudioResource = async (
@@ -3096,7 +3234,8 @@ export const createSeekeableAudioResource = async (
   volume: number = 1.0,
   audioMixer: AudioMixer | null = null,
   returnPCM: boolean = false,
-  enableAGC: boolean = true
+  enableAGC: boolean = true,
+  enableCrossfade: boolean = false
 ): Promise<StreamAudioResource | ErrorResponse> => {
   try {
     const hinted = String(player.streamInfo?.format ?? '').toLowerCase()
@@ -3152,7 +3291,8 @@ export const createSeekeableAudioResource = async (
         volume,
         audioMixer,
         returnPCM,
-        returnPCM ? true : (player.loudnessNormalizer ?? enableAGC)
+        returnPCM ? true : (player.loudnessNormalizer ?? enableAGC),
+        enableCrossfade
       )
     }
 
@@ -3187,7 +3327,8 @@ export const createSeekeableAudioResource = async (
       volume,
       audioMixer,
       returnPCM,
-      returnPCM ? true : (player.loudnessNormalizer ?? enableAGC)
+      returnPCM ? true : (player.loudnessNormalizer ?? enableAGC),
+      enableCrossfade
     )
   } catch (err) {
     const cause = err instanceof SeekError ? err.code : 'UNKNOWN'
