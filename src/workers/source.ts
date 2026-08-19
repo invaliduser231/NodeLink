@@ -50,6 +50,13 @@ import {
 
 const __filename = fileURLToPath(import.meta.url)
 
+/**
+ * Sources whose stream URLs point at encrypted payloads. Their `loadStream(...)`
+ * implementation performs the decryption, so the seekable range reader must not
+ * fetch those URLs directly.
+ */
+const SOURCES_REQUIRING_DECRYPTION = new Set(['deezer'])
+
 const getActiveResourcesBreakdown = (): Record<string, number> => {
   const list = process.getActiveResourcesInfo?.() ?? []
   const counters: Record<string, number> = {}
@@ -1369,8 +1376,17 @@ if (isMainThread) {
       const isHls = urlResult.protocol === 'hls'
       const isSabr = urlResult.protocol === 'sabr'
       const isLocal = sourceName === 'local'
+      const requiresSourceDecryption = SOURCES_REQUIRING_DECRYPTION.has(
+        String(sourceName ?? '').toLowerCase()
+      )
 
-      if (urlResult.url && !isHls && !isLocal && !isSabr) {
+      if (
+        urlResult.url &&
+        !isHls &&
+        !isLocal &&
+        !isSabr &&
+        !requiresSourceDecryption
+      ) {
         const resource = await createSeekeableAudioResource(
           id,
           urlResult.url,
