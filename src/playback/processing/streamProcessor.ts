@@ -1025,6 +1025,10 @@ class SymphoniaDecoderStream extends Transform {
   private _isDecoding: boolean
   private _timeoutId: ReturnType<typeof setTimeout> | null
   private _immediateId: ReturnType<typeof setImmediate> | null
+  private resampler: ResamplerLike | null
+  private resamplerPromise: Promise<ResamplerLike | null> | null
+  private resamplerSourceRate: number | null
+  private pendingResampleQueue: Buffer[]
 
   constructor(options: SymphoniaDecoderStreamOptions = {}) {
     const { codecRegistryHint, ...streamOptions } = options
@@ -1044,6 +1048,61 @@ class SymphoniaDecoderStream extends Transform {
     this._isDecoding = false
     this._timeoutId = null
     this._immediateId = null
+    this.resampler = null
+    this.resamplerPromise = null
+    this.resamplerSourceRate = null
+    this.pendingResampleQueue = []
+  }
+
+  _ensureResampler(sampleRate: number): void {
+    if (this.resampler || this.resamplerPromise) return
+
+    this.resamplerSourceRate = sampleRate
+    this.resamplerPromise = getLibSampleRate()
+      .then((libSampleRate) =>
+        libSampleRate.create(
+          AUDIO_CONFIG.channels,
+          sampleRate,
+          AUDIO_CONFIG.sampleRate,
+          {
+            converterType: _getResamplerConverterType(
+              'fastest' as ResamplingQuality,
+              libSampleRate
+            )
+          }
+        )
+      )
+      .then((resampler: ResamplerLike) => {
+        this.resampler = resampler
+        this.resamplerPromise = null
+        this._scheduleDecode()
+        return resampler
+      })
+      .catch((err) => {
+        this.resamplerPromise = null
+        this.pendingResampleQueue = []
+        this.emit('error', err instanceof Error ? err : new Error(String(err)))
+        return null
+      })
+  }
+
+  _resampleSamples(samples: Buffer): Buffer {
+    if (!this.resampler) return samples
+
+    const input = new Int16Array(
+      samples.buffer,
+      samples.byteOffset,
+      Math.floor(samples.length / 2)
+    )
+    const asFloat = new Float32Array(input.length)
+    for (let i = 0; i < input.length; i++) asFloat[i] = input[i]! / 32768
+
+    const resampled = this.resampler.full(asFloat)
+    const output = new Int16Array(resampled.length)
+    for (let i = 0; i < resampled.length; i++) {
+      output[i] = Math.max(-1, Math.min(1, resampled[i] || 0)) * 32767
+    }
+    return Buffer.from(output.buffer, output.byteOffset, output.byteLength)
   }
 
   abort(): void {
@@ -1151,7 +1210,38 @@ class SymphoniaDecoderStream extends Transform {
 
         decodeCount++
         if (result.samples.length === 0) continue
-        if (!this.push(result.samples)) {
+
+        const needsResampling =
+          typeof result.sampleRate === 'number' &&
+          result.sampleRate > 0 &&
+          result.sampleRate !== AUDIO_CONFIG.sampleRate
+
+        if (!needsResampling) {
+          if (!this.push(result.samples)) {
+            this._scheduleDecode(AUDIO_CONSTANTS.decodeIntervalMs)
+            return
+          }
+          continue
+        }
+
+        this._ensureResampler(result.sampleRate)
+
+        if (!this.resampler) {
+          this.pendingResampleQueue.push(result.samples)
+          this._scheduleDecode(AUDIO_CONSTANTS.decodeIntervalMs)
+          return
+        }
+
+        let backpressure = false
+        while (this.pendingResampleQueue.length > 0) {
+          const queued = this.pendingResampleQueue.shift()
+          if (!queued) continue
+          if (!this.push(this._resampleSamples(queued))) backpressure = true
+        }
+        if (!this.push(this._resampleSamples(result.samples))) {
+          backpressure = true
+        }
+        if (backpressure) {
           this._scheduleDecode(AUDIO_CONSTANTS.decodeIntervalMs)
           return
         }
@@ -1246,6 +1336,15 @@ class SymphoniaDecoderStream extends Transform {
       } catch {}
       this.decoder = null
     }
+
+    if (this.resampler) {
+      try {
+        this.resampler.destroy?.()
+      } catch {}
+      this.resampler = null
+    }
+    this.resamplerPromise = null
+    this.pendingResampleQueue = []
   }
 }
 
