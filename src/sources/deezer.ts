@@ -1071,9 +1071,8 @@ export default class DeezerSource {
                 {
                   type: 'FULL',
                   formats: [
-                    { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
-                    { cipher: 'BF_CBC_STRIPE', format: 'MP3_256' },
                     { cipher: 'BF_CBC_STRIPE', format: 'MP3_128' },
+                    { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
                     { cipher: 'BF_CBC_STRIPE', format: 'MP3_MISC' }
                   ]
                 }
