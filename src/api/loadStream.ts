@@ -35,6 +35,13 @@ const LOAD_STREAM_HEADERS = {
 } as const
 
 /**
+ * Sources whose stream URLs point at encrypted payloads. Their `loadStream(...)`
+ * implementation performs the decryption, so the seekable range reader must not
+ * fetch those URLs directly.
+ */
+const SOURCES_REQUIRING_DECRYPTION = new Set(['deezer'])
+
+/**
  * Request payload accepted by the load stream endpoint.
  */
 interface LoadStreamInput {
@@ -818,11 +825,20 @@ async function handler(
     const isHls = urlResult.protocol === 'hls'
     const isSabr = urlResult.protocol === 'sabr'
     const isLocal = sourceName === 'local'
+    const requiresSourceDecryption = SOURCES_REQUIRING_DECRYPTION.has(
+      String(sourceName ?? '').toLowerCase()
+    )
 
     let pcmStream: DestroyableReadable | null = null
     let fetchedStream: DestroyableReadable | null = null
 
-    if (urlResult.url && !isHls && !isLocal && !isSabr) {
+    if (
+      urlResult.url &&
+      !isHls &&
+      !isLocal &&
+      !isSabr &&
+      !requiresSourceDecryption
+    ) {
       const resource = (await createSeekeableAudioResource(
         input.guildId || 'api-stream',
         urlResult.url,
