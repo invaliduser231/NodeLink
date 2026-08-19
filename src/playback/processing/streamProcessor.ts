@@ -1029,6 +1029,9 @@ class SymphoniaDecoderStream extends Transform {
   private resamplerPromise: Promise<ResamplerLike | null> | null
   private resamplerSourceRate: number | null
   private pendingResampleQueue: Buffer[]
+  private _loggedFormat: boolean
+  private _decodedBytes: number
+  private _decodeCalls: number
 
   constructor(options: SymphoniaDecoderStreamOptions = {}) {
     const { codecRegistryHint, ...streamOptions } = options
@@ -1052,6 +1055,9 @@ class SymphoniaDecoderStream extends Transform {
     this.resamplerPromise = null
     this.resamplerSourceRate = null
     this.pendingResampleQueue = []
+    this._loggedFormat = false
+    this._decodedBytes = 0
+    this._decodeCalls = 0
   }
 
   _ensureResampler(sampleRate: number): void {
@@ -1209,6 +1215,16 @@ class SymphoniaDecoderStream extends Transform {
         }
 
         decodeCount++
+        this._decodeCalls++
+        this._decodedBytes += result.samples.length
+        if (!this._loggedFormat) {
+          this._loggedFormat = true
+          logger(
+            'info',
+            'SymphoniaDecoder',
+            `hint=${this.codecRegistryHint} sampleRate=${result.sampleRate} channels=${result.channels} firstFrameBytes=${result.samples.length}`
+          )
+        }
         if (result.samples.length === 0) continue
 
         const needsResampling =
@@ -1259,6 +1275,11 @@ class SymphoniaDecoderStream extends Transform {
     const callback = this.flushCallback
     this.flushCallback = null
     this.isFinished = true
+    logger(
+      'info',
+      'SymphoniaDecoder',
+      `finished: decodeCalls=${this._decodeCalls} pcmBytes=${this._decodedBytes} audioSeconds=${(this._decodedBytes / 192000).toFixed(1)}`
+    )
     this._cleanup()
     callback?.()
   }
