@@ -1071,7 +1071,7 @@ export default class DeezerSource {
                 {
                   type: 'FULL',
                   formats: [
-                    { cipher: 'BF_CBC_STRIPE', format: 'FLAC' },
+                    { cipher: 'BF_CBC_STRIPE', format: 'MP3_320' },
                     { cipher: 'BF_CBC_STRIPE', format: 'MP3_256' },
                     { cipher: 'BF_CBC_STRIPE', format: 'MP3_128' },
                     { cipher: 'BF_CBC_STRIPE', format: 'MP3_MISC' }
@@ -1105,6 +1105,12 @@ export default class DeezerSource {
           )
           return result
         }
+
+        logger(
+          'warn',
+          'Deezer',
+          `No playable media returned for ${decodedTrack.title} (format: ${media?.format ?? 'none'}). Falling back to default search.`
+        )
       } catch (error) {
         const errMsg = this.getErrorMessage(error)
         if (errMsg.toLowerCase().includes('csrf') && !forceRefresh) {
