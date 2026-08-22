@@ -2440,10 +2440,34 @@ function applyEnvOverrides(
 }
 
 /**
+ * Normalizes an ISRC for comparison, returning null when it is not a valid one.
+ * @param value - Raw ISRC value.
+ * @returns Normalized 12 character ISRC or null.
+ * @public
+ */
+export function normalizeIsrc(value: unknown): string | null {
+  const normalized = String(value ?? '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+  return normalized.length === 12 ? normalized : null
+}
+
+/**
+ * Minimum share of the original title words a candidate has to carry before it
+ * is considered the same song at all.
+ */
+const MIN_TITLE_OVERLAP = 0.5
+
+/**
  * Selects the best match from a list of track candidates.
  *
  * Scoring factors include word overlap, spec keywords, author similarity,
  * duration tolerance, and explicit content handling.
+ *
+ * A candidate carrying the same ISRC as the original is always preferred, since
+ * that identifies the exact same recording. When `minScore` is set, candidates
+ * that fail the title, duration or specification checks are rejected instead of
+ * falling back to the first search hit.
  * @param list - Candidate list to score.
  * @param original - Original track metadata.
  * @param options - Scoring options.
@@ -2455,7 +2479,21 @@ export function getBestMatch<T extends BestMatchCandidate>(
   original: BestMatchTrackInfo,
   options: BestMatchOptions = {}
 ): T | null {
-  const { durationTolerance = 0.15, allowExplicit = true } = options
+  const {
+    durationTolerance = 0.15,
+    allowExplicit = true,
+    minScore,
+    requireIsrc = false
+  } = options
+
+  const originalIsrc = normalizeIsrc(original.isrc)
+  if (originalIsrc) {
+    const isrcMatch = list.find(
+      (item) => normalizeIsrc(item.info.isrc) === originalIsrc
+    )
+    if (isrcMatch) return isrcMatch
+  }
+  if (requireIsrc) return null
 
   const normalize = (str: string): string => {
     if (!str) return ''
@@ -2489,6 +2527,14 @@ export function getBestMatch<T extends BestMatchCandidate>(
     'slowed',
     'reverb'
   ]
+  const hardSpecKeywords = [
+    'remix',
+    'live',
+    'cover',
+    'acoustic',
+    'instrumental',
+    'karaoke'
+  ]
   const findSpec = (str: string): string[] =>
     specKeywords.filter((k) => str.toLowerCase().includes(k))
 
@@ -2500,6 +2546,7 @@ export function getBestMatch<T extends BestMatchCandidate>(
 
   const targetDuration = original.length
   const allowedDiff = targetDuration * durationTolerance
+  const hardDurationDiff = Math.max(15_000, targetDuration * durationTolerance)
   const normOriginalAuthor = normalize(original.author)
   const originalWords = new Set(
     normalize(original.title)
@@ -2515,6 +2562,7 @@ export function getBestMatch<T extends BestMatchCandidate>(
     const isItemClean =
       itemTitle.includes('clean') || itemTitle.includes('radio edit')
     let score = 0
+    let rejected = false
 
     const itemWords = normItemTitle.split(' ').filter((w) => w.length > 1)
     const itemWordsSet = new Set(itemWords)
@@ -2523,13 +2571,21 @@ export function getBestMatch<T extends BestMatchCandidate>(
     for (const word of originalWords) {
       if (itemWordsSet.has(word)) overlap++
     }
-    score += (overlap / Math.max(originalWords.size, 1)) * 300
+    const overlapRatio = overlap / Math.max(originalWords.size, 1)
+    score += overlapRatio * 300
+
+    if (originalWords.size > 0 && overlapRatio < MIN_TITLE_OVERLAP) {
+      rejected = true
+    }
 
     for (const spec of specKeywords) {
       const inOriginal = originalSpec.includes(spec)
       const inItem = itemSpec.includes(spec)
       if (inOriginal && inItem) score += 200
-      if (inOriginal !== inItem) score -= 300
+      if (inOriginal !== inItem) {
+        score -= 300
+        if (hardSpecKeywords.includes(spec)) rejected = true
+      }
     }
 
     if (isOriginalExplicit && !allowExplicit) {
@@ -2559,18 +2615,23 @@ export function getBestMatch<T extends BestMatchCandidate>(
         score += (1 - diff / allowedDiff) * 100
       } else {
         score -= 100
+        if (item.info.length > 0 && diff > hardDurationDiff) rejected = true
       }
     }
 
     if (itemTitle.includes('official audio') || itemTitle.includes('topic'))
       score += 50
 
-    return { item, score }
+    return { item, score, rejected }
   })
 
   scored.sort((a, b) => b.score - a.score)
 
-  return scored[0]?.item || list[0] || null
+  if (minScore === undefined) return scored[0]?.item || list[0] || null
+
+  const best = scored.find((entry) => !entry.rejected)
+  if (!best || best.score < minScore) return null
+  return best.item
 }
 
 /**

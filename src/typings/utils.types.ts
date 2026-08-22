@@ -368,6 +368,14 @@ export interface BestMatchOptions {
   durationTolerance?: number
   /** Whether explicit tracks are allowed. */
   allowExplicit?: boolean
+  /**
+   * Minimum score a candidate must reach to be returned. When set, candidates
+   * that fail the title, duration or specification checks are rejected instead
+   * of falling back to the first search hit.
+   */
+  minScore?: number
+  /** When true, only candidates carrying the same ISRC are accepted. */
+  requireIsrc?: boolean
 }
 
 /**
@@ -383,6 +391,8 @@ export interface BestMatchTrackInfo {
   length: number
   /** Track URI used for explicit checks. */
   uri?: string | null
+  /** Recording identifier used to match the exact same recording. */
+  isrc?: string | null
 }
 
 /**
