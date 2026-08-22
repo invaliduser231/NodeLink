@@ -141,7 +141,13 @@ export default class ConfigValidationManager {
           },
           unifiedSources: { type: 'array', items: 'string', optional: true },
           resolveExternalLinks: { type: 'boolean', default: false },
-          fetchChannelInfo: { type: 'boolean', default: false }
+          fetchChannelInfo: { type: 'boolean', default: false },
+          sourceTimeoutMs: {
+            type: 'number',
+            integer: true,
+            min: 0,
+            default: 6000
+          }
         }
       },
       playback: {

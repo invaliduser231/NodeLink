@@ -165,7 +165,8 @@ export const config: NodelinkConfig = {
     defaultSource: ['youtube', 'soundcloud'],
     unifiedSources: ['youtube', 'soundcloud'],
     resolveExternalLinks: false,
-    fetchChannelInfo: false
+    fetchChannelInfo: false,
+    sourceTimeoutMs: 6000
   },
 
   playback: {

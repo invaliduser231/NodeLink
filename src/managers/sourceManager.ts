@@ -49,6 +49,94 @@ const MIRROR_CACHE_NAMESPACE = 'mirror'
 const MIRROR_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 
 /**
+ * Rejects a pending source call once it exceeds the given budget, so one slow
+ * source cannot hold up an entire unified search.
+ * @param promise - The pending call.
+ * @param ms - Time budget in milliseconds.
+ * @returns The original result, or a rejection once the budget is spent.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  if (!(ms > 0)) return promise
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`timed out after ${ms}ms`)),
+      ms
+    )
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      }
+    )
+  })
+}
+
+/**
+ * Merges per source result lists round robin, so the first hits of every source
+ * appear before the second hit of the fastest one.
+ * @param lists - One result list per source.
+ * @returns A single merged list.
+ */
+export function interleave<T>(lists: T[][]): T[] {
+  const merged: T[] = []
+  const longest = Math.max(0, ...lists.map((list) => list.length))
+  for (let index = 0; index < longest; index++) {
+    for (const list of lists) {
+      const item = list[index]
+      if (item !== undefined) merged.push(item)
+    }
+  }
+  return merged
+}
+
+/**
+ * Drops duplicates that several sources returned for the same recording.
+ * @param tracks - Merged track list.
+ * @returns The list without duplicates, original order preserved.
+ */
+export function dedupeTracks(tracks: TrackData[]): TrackData[] {
+  const seen = new Set<string>()
+  const unique: TrackData[] = []
+
+  const normalize = (value: unknown) =>
+    String(value ?? '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+
+  for (const track of tracks) {
+    const info = track.info
+    if (!info) continue
+
+    const keys: string[] = []
+    const isrc = normalizeIsrc(info.isrc)
+    if (isrc) keys.push(`isrc:${isrc}`)
+
+    const uri = String(info.uri ?? '').toLowerCase()
+    if (uri) keys.push(`uri:${uri}`)
+
+    keys.push(
+      [
+        'meta',
+        normalize(info.title),
+        normalize(info.author),
+        Math.round(Number(info.length ?? 0) / 3000)
+      ].join('|')
+    )
+
+    if (keys.some((key) => seen.has(key))) continue
+    for (const key of keys) seen.add(key)
+    unique.push(track)
+  }
+
+  return unique
+}
+
+/**
  * Context object required by the SourcesManager for operation.
  * @public
  */
@@ -588,8 +676,12 @@ export default class SourcesManager implements SourceManagerLike {
       `Performing unified search for "${query}" on [${searchSources.join(', ')}]`
     )
 
+    const timeoutMs = this.nodelink.options.search.sourceTimeoutMs ?? 6000
     const searchPromises = searchSources.map((sourceName: string) =>
-      this._instrumentedSourceCall(sourceName, 'search', query).catch((e) => {
+      withTimeout(
+        this._instrumentedSourceCall(sourceName, 'search', query),
+        timeoutMs
+      ).catch((e) => {
         logger(
           'warn',
           'Sources',
@@ -604,12 +696,12 @@ export default class SourcesManager implements SourceManagerLike {
 
     const results = await Promise.all(searchPromises)
 
-    const allTracks: TrackData[] = []
-    for (const result of results) {
-      if (result.loadType === 'search' && Array.isArray(result.data)) {
-        allTracks.push(...result.data)
-      }
-    }
+    const perSource = results.map((result) =>
+      result.loadType === 'search' && Array.isArray(result.data)
+        ? (result.data as TrackData[])
+        : []
+    )
+    const allTracks = dedupeTracks(interleave(perSource))
 
     if (allTracks.length === 0) {
       return { loadType: 'empty', data: {} }

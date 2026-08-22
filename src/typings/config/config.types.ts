@@ -1201,6 +1201,8 @@ export interface NodelinkConfig {
     unifiedSources: string[]
     resolveExternalLinks: boolean
     fetchChannelInfo: boolean
+    /** Time budget per source in a unified search, in milliseconds. */
+    sourceTimeoutMs?: number
   }
   playback: {
     maxPlaylistLength: number
