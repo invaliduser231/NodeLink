@@ -210,6 +210,7 @@ export type TaskType =
   | 'loadLiveChat'
   | 'cancelLiveChat'
   | 'profilerCommand'
+  | 'mirrorStats'
 
 /**
  * Base task payload structure

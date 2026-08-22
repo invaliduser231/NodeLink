@@ -5,7 +5,7 @@ import type {
   ApiRouteModule,
   ApiSendResponse
 } from '../typings/api/api.types.ts'
-import type { StatsSnapshot } from '../typings/api/stats.types.ts'
+import type { MirrorStats, StatsSnapshot } from '../typings/api/stats.types.ts'
 import type {
   NodelinkRuntime,
   ServerStatsPayload
@@ -87,13 +87,60 @@ function getStatsRuntime(
  * @param nodelink - Strongly typed runtime for the stats endpoint.
  * @returns Aggregate server stats plus the detailed stats manager snapshot.
  */
-function buildStatsResponse(nodelink: StatsRouteRuntime): StatsResponse {
+async function buildStatsResponse(
+  nodelink: StatsRouteRuntime
+): Promise<StatsResponse> {
   const payload = getStats(nodelink)
   const detailedStats = nodelink.statsManager.getSnapshot()
+
+  const workerMirror = await readWorkerMirrorStats(nodelink)
+  if (workerMirror) {
+    detailedStats.mirror = {
+      attempts: detailedStats.mirror.attempts + workerMirror.attempts,
+      cacheHits: detailedStats.mirror.cacheHits + workerMirror.cacheHits,
+      isrcHits: detailedStats.mirror.isrcHits + workerMirror.isrcHits,
+      rejected: detailedStats.mirror.rejected + workerMirror.rejected
+    }
+  }
 
   return {
     ...payload,
     detailedStats
+  }
+}
+
+/**
+ * Reads the mirror counters from the source worker.
+ *
+ * Mirroring happens inside the source worker whenever one is running, so the
+ * counters of the main process alone would always read zero.
+ *
+ * @param nodelink - Router-facing NodeLink runtime.
+ * @returns The worker counters, or null when no worker answered.
+ */
+async function readWorkerMirrorStats(
+  nodelink: StatsRouteRuntime
+): Promise<MirrorStats | null> {
+  const manager = (
+    nodelink as unknown as {
+      workerManager?: {
+        getBestWorker: () => unknown
+        execute: (worker: unknown, task: string, payload: unknown) => unknown
+      }
+    }
+  ).workerManager
+  if (!manager) return null
+
+  try {
+    const worker = manager.getBestWorker()
+    if (!worker) return null
+    const result = (await manager.execute(worker, 'mirrorStats', {})) as
+      | MirrorStats
+      | null
+      | undefined
+    return result ?? null
+  } catch {
+    return null
   }
 }
 
@@ -109,12 +156,12 @@ function buildStatsResponse(nodelink: StatsRouteRuntime): StatsResponse {
  * @param sendResponse - Helper responsible for JSON serialization and headers.
  * @returns Nothing. The payload is written directly to the response.
  */
-function handler(
+async function handler(
   nodelink: ApiNodelinkServer,
   req: ApiRequest,
   res: ApiResponse,
   sendResponse: ApiSendResponse
-): void {
+): Promise<void> {
   const runtime = getStatsRuntime(nodelink)
 
   if (!runtime) {
@@ -133,7 +180,7 @@ function handler(
     return
   }
 
-  sendResponse(req, res, buildStatsResponse(runtime), 200)
+  sendResponse(req, res, await buildStatsResponse(runtime), 200)
 }
 
 /**

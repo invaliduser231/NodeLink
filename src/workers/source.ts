@@ -1539,6 +1539,9 @@ if (isMainThread) {
             (payload as Record<string, unknown>) || {}
           )
           break
+        case 'mirrorStats':
+          result = nodelink.statsManager?.getSnapshot?.()?.mirror ?? null
+          break
       }
       ;(parentPort as MessagePort).postMessage({
         type: 'result',
