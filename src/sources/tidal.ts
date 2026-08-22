@@ -117,9 +117,9 @@ export default class TidalSource {
     this.playlistPageLoadConcurrency =
       this.asNumber(this.config.playlistPageLoadConcurrency) ?? 5
     this.tokenCachePath = path.join(process.cwd(), '.cache', 'tidal_token.json')
-    this.hifiApis = this.toStringArray(this.config.hifiApis).map((url) =>
-      url.replace(/\/$/, '')
-    )
+    this.hifiApis = this.toStringArray(this.config.hifiApis)
+      .map((url) => url.trim().replace(/\/$/, ''))
+      .filter(Boolean)
     const configuredQualities = this.toStringArray(this.config.hifiQualities)
     this.hifiQualities =
       configuredQualities.length > 0
@@ -766,7 +766,7 @@ export default class TidalSource {
     trackId: string
   ): Promise<{ url: string; quality: string; format: string } | null> {
     if (this.hifiApis.length === 0) {
-      logger('warn', 'Tidal', 'No hifi APIs configured, skipping direct stream')
+      logger('debug', 'Tidal', 'No hifi APIs configured, mirroring instead')
       return null
     }
 
