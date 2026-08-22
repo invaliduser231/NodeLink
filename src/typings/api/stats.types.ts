@@ -73,6 +73,26 @@ export interface StatsSnapshot {
    * Playback event counters.
    */
   playback: PlaybackStats
+
+  /**
+   * Counters describing how non streamable tracks were mirrored.
+   */
+  mirror: MirrorStats
+}
+
+/**
+ * Counters for mirror resolution of tracks whose own source cannot stream them.
+ * @public
+ */
+export interface MirrorStats {
+  /** Mirror resolutions started. */
+  attempts: number
+  /** Resolutions answered from the mirror cache. */
+  cacheHits: number
+  /** Resolutions matched through an exact ISRC lookup. */
+  isrcHits: number
+  /** Resolutions that found no candidate matching the requested track. */
+  rejected: number
 }
 
 /**

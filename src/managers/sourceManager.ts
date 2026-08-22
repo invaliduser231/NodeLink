@@ -38,6 +38,17 @@ const ISRC_CAPABLE_SOURCES = ['dzisrc', 'qbisrc']
 const MIRROR_MIN_SCORE = 150
 
 /**
+ * Cache namespace holding the resolved stand-in for a non streamable track.
+ */
+const MIRROR_CACHE_NAMESPACE = 'mirror'
+
+/**
+ * How long a mirror decision stays valid. Mirrors are stable in practice, so a
+ * long window saves the whole search on every repeat play.
+ */
+const MIRROR_CACHE_TTL_MS = 6 * 60 * 60 * 1000
+
+/**
  * Context object required by the SourcesManager for operation.
  * @public
  */
@@ -52,6 +63,14 @@ export interface SourcesManagerContext {
     incrementSourceFailure?: (source: string) => void
     /** Records an occurrences of a playback event. */
     incrementPlaybackEvent?: (event: string) => void
+    /** Counts a started mirror resolution. */
+    incrementMirrorAttempt?: () => void
+    /** Counts a mirror resolution answered from the cache. */
+    incrementMirrorCacheHit?: () => void
+    /** Counts a mirror resolution matched by an exact ISRC lookup. */
+    incrementMirrorIsrcHit?: () => void
+    /** Counts a mirror resolution without an acceptable candidate. */
+    incrementMirrorRejected?: () => void
   }
   /** Global credential manager for token persistence. */
   credentialManager?: {
@@ -488,13 +507,31 @@ export default class SourcesManager implements SourceManagerLike {
     track: TrackInfo,
     options: { allowExplicit?: boolean } = {}
   ): Promise<TrackInfo | null> {
+    const stats = this.nodelink.statsManager
+    stats?.incrementMirrorAttempt?.()
+
+    const cache = this.nodelink.trackCacheManager
+    const cacheKey = `${track.sourceName}:${track.identifier}`
+    const cached = cache?.get<TrackInfo>(MIRROR_CACHE_NAMESPACE, cacheKey)
+    if (cached) {
+      stats?.incrementMirrorCacheHit?.()
+      logger(
+        'debug',
+        'Mirror',
+        `Reused cached mirror for "${track.title}" on ${cached.sourceName}`
+      )
+      return cached
+    }
+
     const isrcMatch = track.isrc ? await this.searchByIsrc(track.isrc) : null
     if (isrcMatch) {
+      stats?.incrementMirrorIsrcHit?.()
       logger(
         'info',
         'Mirror',
         `Matched "${track.title}" by ISRC on ${isrcMatch.sourceName}`
       )
+      cache?.set(MIRROR_CACHE_NAMESPACE, cacheKey, isrcMatch, MIRROR_CACHE_TTL_MS)
       return isrcMatch
     }
 
@@ -507,6 +544,7 @@ export default class SourcesManager implements SourceManagerLike {
       !Array.isArray(searchResult.data) ||
       searchResult.data.length === 0
     ) {
+      stats?.incrementMirrorRejected?.()
       logger('warn', 'Mirror', `No candidates found for "${query}"`)
       return null
     }
@@ -518,6 +556,7 @@ export default class SourcesManager implements SourceManagerLike {
         : {})
     })
     if (!best) {
+      stats?.incrementMirrorRejected?.()
       logger(
         'warn',
         'Mirror',
@@ -531,6 +570,7 @@ export default class SourcesManager implements SourceManagerLike {
       'Mirror',
       `Matched "${track.title}" by search on ${best.info.sourceName}: "${best.info.title}"`
     )
+    cache?.set(MIRROR_CACHE_NAMESPACE, cacheKey, best.info, MIRROR_CACHE_TTL_MS)
     return best.info
   }
 

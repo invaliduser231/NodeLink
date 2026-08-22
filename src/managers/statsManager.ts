@@ -117,6 +117,12 @@ export default class StatsManager {
       sources: {},
       playback: {
         events: {}
+      },
+      mirror: {
+        attempts: 0,
+        cacheHits: 0,
+        isrcHits: 0,
+        rejected: 0
       }
     }
     this.initialized = false
@@ -614,6 +620,34 @@ export default class StatsManager {
     if (this.promPlaybackEvents) {
       this.promPlaybackEvents.inc({ event_type: key })
     }
+  }
+
+  /**
+   * Counts a started mirror resolution.
+   */
+  incrementMirrorAttempt(): void {
+    this.stats.mirror.attempts++
+  }
+
+  /**
+   * Counts a mirror resolution answered from the cache.
+   */
+  incrementMirrorCacheHit(): void {
+    this.stats.mirror.cacheHits++
+  }
+
+  /**
+   * Counts a mirror resolution matched through an exact ISRC lookup.
+   */
+  incrementMirrorIsrcHit(): void {
+    this.stats.mirror.isrcHits++
+  }
+
+  /**
+   * Counts a mirror resolution that found no acceptable candidate.
+   */
+  incrementMirrorRejected(): void {
+    this.stats.mirror.rejected++
   }
 
   /**
