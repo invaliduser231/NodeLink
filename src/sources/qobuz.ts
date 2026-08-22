@@ -6,12 +6,10 @@ import type {
   WorkerNodeLink
 } from '../typings/sources/source.types.ts'
 import type {
-  BestMatchCandidate,
   TrackEncodeInput
 } from '../typings/utils.types.ts'
 import {
   encodeTrack,
-  getBestMatch,
   http1makeRequest,
   logger
 } from '../utils.ts'
@@ -735,62 +733,12 @@ export default class QobuzSource {
   ): Promise<
     TrackUrlResult | { exception: { message: string; severity: string } }
   > {
-    const query = `${decodedTrack.title} ${decodedTrack.author}`
     try {
-      let result = await this.nodelink.sources.searchWithDefault(
-        decodedTrack.isrc ? `"${decodedTrack.isrc}"` : query
+      const fallbackTrack = await this.nodelink.sources.mirrorTrack(
+        decodedTrack,
+        { allowExplicit: this.getAllowExplicit() }
       )
 
-      if (
-        result.loadType !== 'search' ||
-        !Array.isArray(result.data) ||
-        result.data.length === 0
-      ) {
-        result = await this.nodelink.sources.searchWithDefault(query)
-      }
-
-      if (
-        result.loadType !== 'search' ||
-        !Array.isArray(result.data) ||
-        result.data.length === 0
-      ) {
-        return {
-          exception: {
-            message: 'No mirror found for this track.',
-            severity: 'common'
-          }
-        }
-      }
-
-      const tracks = this.toTrackInfoArray(result.data)
-      if (tracks.length === 0) {
-        return {
-          exception: {
-            message: 'No mirror found for this track.',
-            severity: 'common'
-          }
-        }
-      }
-
-      const candidates: BestMatchCandidate[] = tracks.map((track) => ({
-        info: track
-      }))
-      const best = getBestMatch(candidates, decodedTrack, {
-        allowExplicit: this.getAllowExplicit()
-      })
-
-      if (!best) {
-        return {
-          exception: { message: 'No suitable match found.', severity: 'common' }
-        }
-      }
-
-      const fallbackTrack = tracks.find(
-        (track) =>
-          track.title === best.info.title &&
-          track.author === best.info.author &&
-          track.length === best.info.length
-      )
       if (!fallbackTrack) {
         return {
           exception: { message: 'No suitable match found.', severity: 'common' }

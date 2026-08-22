@@ -26,7 +26,6 @@ import type {
 } from '../typings/sources/spotify.types.ts'
 import {
   encodeTrack,
-  getBestMatch,
   http1makeRequest,
   logger
 } from '../utils.ts'
@@ -1325,25 +1324,8 @@ export default class SpotifySource implements SourceInstance {
         }
       }
     }
-    const query = `${track.title} ${track.author}`
     try {
-      let res = await sm.searchWithDefault(
-        track.isrc ? `"${track.isrc}"` : query
-      )
-      if (res.loadType !== 'search' || !res.data.length) {
-        res = await sm.searchWithDefault(query)
-      }
-      if (res.loadType !== 'search' || !res.data.length) {
-        return {
-          exception: {
-            message: 'No alternative stream found for this track.',
-            severity: 'fault'
-          }
-        }
-      }
-      const best = getBestMatch(res.data, track, {
-        allowExplicit: this.config.allowExplicit
-      })
+      const best = await sm.mirrorTrack(track)
       if (!best) {
         return {
           exception: {
@@ -1352,8 +1334,8 @@ export default class SpotifySource implements SourceInstance {
           }
         }
       }
-      const url = await sm.getTrackUrl(best.info as TrackInfo)
-      return { newTrack: { info: best.info as TrackInfo }, ...url }
+      const url = await sm.getTrackUrl(best)
+      return { newTrack: { info: best }, ...url }
     } catch (e) {
       return {
         exception: {

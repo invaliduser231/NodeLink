@@ -34,7 +34,6 @@ import type {
 import type { TrackEncodeInput } from '../typings/utils.types.ts'
 import {
   encodeTrack,
-  getBestMatch,
   http1makeRequest,
   logger,
   makeRequest
@@ -1096,33 +1095,7 @@ export default class PandoraSource implements SourceInstance {
     }
 
     try {
-      let searchResult = await sources.searchWithDefault(
-        decodedTrack.isrc ? `"${decodedTrack.isrc}"` : query
-      )
-
-      if (
-        searchResult?.loadType !== 'search' ||
-        !Array.isArray(searchResult.data) ||
-        searchResult.data.length === 0
-      ) {
-        searchResult = await sources.searchWithDefault(query)
-      }
-
-      if (
-        searchResult.loadType !== 'search' ||
-        !Array.isArray(searchResult.data) ||
-        searchResult.data.length === 0
-      ) {
-        return {
-          exception: {
-            message: 'No matching track found on default source.',
-            severity: 'common'
-          }
-        }
-      }
-
-      const candidates = searchResult.data as PandoraTrackData[]
-      const bestMatch = getBestMatch(candidates, decodedTrack)
+      const bestMatch = await sources.mirrorTrack(decodedTrack)
 
       if (!bestMatch) {
         return {
@@ -1133,9 +1106,11 @@ export default class PandoraSource implements SourceInstance {
         }
       }
 
-      const trackInfo = bestMatch.info as TrackInfo
-      const streamInfo = await sources.getTrackUrl(trackInfo)
-      return { newTrack: bestMatch as PandoraTrackData, ...streamInfo }
+      const streamInfo = await sources.getTrackUrl(bestMatch)
+      return {
+        newTrack: { info: bestMatch } as PandoraTrackData,
+        ...streamInfo
+      }
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
       logger('error', 'Pandora', `Failed to mirror track: ${message}`)

@@ -23,7 +23,19 @@ import type {
   TrackStreamResult,
   TrackUrlResult
 } from '../typings/sources/source.types.ts'
-import { getBestMatch, logger } from '../utils.ts'
+import { getBestMatch, logger, normalizeIsrc } from '../utils.ts'
+
+/**
+ * Sources able to resolve an ISRC to the exact recording. Plain text search
+ * engines are deliberately excluded, they treat an ISRC as free text.
+ */
+const ISRC_CAPABLE_SOURCES = ['dzisrc', 'qbisrc']
+
+/**
+ * Score a search based mirror candidate has to reach. Roughly corresponds to a
+ * mostly matching title plus either a matching author or a matching duration.
+ */
+const MIRROR_MIN_SCORE = 150
 
 /**
  * Context object required by the SourcesManager for operation.
@@ -419,6 +431,110 @@ export default class SourcesManager implements SourceManagerLike {
   }
 
   /**
+   * Looks a recording up by its ISRC on sources that index ISRCs.
+   *
+   * Plain text search engines such as YouTube do not know what an ISRC is and
+   * answer with arbitrary results, so only sources able to resolve an ISRC
+   * exactly are queried here.
+   * @param isrc - The recording identifier.
+   * @returns The matching track info or null.
+   * @public
+   */
+  public async searchByIsrc(isrc: string): Promise<TrackInfo | null> {
+    const normalized = normalizeIsrc(isrc)
+    if (!normalized) return null
+
+    const activeSources = this.resolvingSources.getStore()
+
+    for (const source of ISRC_CAPABLE_SOURCES) {
+      const instance =
+        this.searchAliasMap.get(source) ?? this.sourceMap.get(source)
+      if (!instance || activeSources?.has(instance)) continue
+
+      try {
+        const result = await this.search(source, normalized)
+        if (
+          result.loadType === 'search' &&
+          Array.isArray(result.data) &&
+          result.data.length > 0
+        ) {
+          const info = result.data[0]?.info
+          if (info) return info
+        }
+      } catch (e) {
+        logger(
+          'debug',
+          'Sources',
+          `ISRC lookup failed on ${source}: ${(e as Error).message}`
+        )
+      }
+    }
+
+    return null
+  }
+
+  /**
+   * Resolves a playable stand-in for a track whose own source cannot stream it.
+   *
+   * Tries an exact ISRC lookup first and only then falls back to a title and
+   * author search, verifying the result so an unrelated song is never played
+   * under the requested track's name.
+   * @param track - The track that needs a playable equivalent.
+   * @param options - Optional scoring overrides, e.g. explicit handling.
+   * @returns The mirrored track info or null when nothing matched.
+   * @public
+   */
+  public async mirrorTrack(
+    track: TrackInfo,
+    options: { allowExplicit?: boolean } = {}
+  ): Promise<TrackInfo | null> {
+    const isrcMatch = track.isrc ? await this.searchByIsrc(track.isrc) : null
+    if (isrcMatch) {
+      logger(
+        'info',
+        'Mirror',
+        `Matched "${track.title}" by ISRC on ${isrcMatch.sourceName}`
+      )
+      return isrcMatch
+    }
+
+    const query = `${track.title} ${track.author}`.trim()
+    if (!query) return null
+
+    const searchResult = await this.searchWithDefault(query)
+    if (
+      searchResult.loadType !== 'search' ||
+      !Array.isArray(searchResult.data) ||
+      searchResult.data.length === 0
+    ) {
+      logger('warn', 'Mirror', `No candidates found for "${query}"`)
+      return null
+    }
+
+    const best = getBestMatch(searchResult.data, track, {
+      minScore: MIRROR_MIN_SCORE,
+      ...(options.allowExplicit !== undefined
+        ? { allowExplicit: options.allowExplicit }
+        : {})
+    })
+    if (!best) {
+      logger(
+        'warn',
+        'Mirror',
+        `Rejected ${searchResult.data.length} candidate(s) for "${query}", none matched the requested track`
+      )
+      return null
+    }
+
+    logger(
+      'info',
+      'Mirror',
+      `Matched "${track.title}" by search on ${best.info.sourceName}: "${best.info.title}"`
+    )
+    return best.info
+  }
+
+  /**
    * Performs a concurrent search across multiple sources and consolidates the results into a playlist.
    * @param query - The search query.
    * @returns A promise resolving to a SourceResult.
@@ -587,7 +703,9 @@ export default class SourcesManager implements SourceManagerLike {
               Array.isArray(searchResult.data) &&
               searchResult.data.length > 0
             ) {
-              const match = getBestMatch(searchResult.data, track)
+              const match = getBestMatch(searchResult.data, track, {
+                requireIsrc: true
+              })
               if (match) {
                 logger(
                   'info',

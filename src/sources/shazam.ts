@@ -12,7 +12,6 @@ import type {
 } from '../typings/utils.types.ts'
 import {
   encodeTrack,
-  getBestMatch,
   http1makeRequest,
   logger
 } from '../utils.ts'
@@ -225,6 +224,18 @@ interface ShazamSourceManager {
    * @returns Source result returned by the manager.
    */
   searchWithDefault: (query: string) => Promise<SourceResult>
+
+  /**
+   * Resolves a verified playable stand-in for a track that cannot be streamed.
+   *
+   * @param track Track information to mirror.
+   * @param options Optional scoring overrides.
+   * @returns Mirrored track info or null.
+   */
+  mirrorTrack: (
+    track: TrackInfo,
+    options?: { allowExplicit?: boolean }
+  ) => Promise<TrackInfo | null>
 
   /**
    * Resolves a playable URL for a track.
@@ -545,30 +556,9 @@ export default class ShazamSource {
     }
 
     try {
-      const query = `${decodedTrack.title} ${decodedTrack.author}`
-      let searchResult = await sourceManager.searchWithDefault(
-        decodedTrack.isrc ? `"${decodedTrack.isrc}"` : query
-      )
-      let searchTracks = this.extractTrackArray(searchResult)
-
-      if (searchTracks.length === 0) {
-        searchResult = await sourceManager.searchWithDefault(query)
-        searchTracks = this.extractTrackArray(searchResult)
-      }
-
-      if (searchTracks.length === 0) {
-        return {
-          loadType: 'error',
-          exception: { message: 'No alternative found.', severity: 'fault' }
-        }
-      }
-
-      const bestMatchCandidate = getBestMatch(searchTracks, decodedTrack, {
+      const bestMatch = await sourceManager.mirrorTrack(decodedTrack, {
         allowExplicit: this.allowExplicit
       })
-      const bestMatch = bestMatchCandidate
-        ? this.findTrackDataByCandidate(searchTracks, bestMatchCandidate)
-        : null
 
       if (!bestMatch) {
         return {
@@ -577,8 +567,8 @@ export default class ShazamSource {
         }
       }
 
-      const stream = await sourceManager.getTrackUrl(bestMatch.info)
-      return { newTrack: bestMatch, ...stream }
+      const stream = await sourceManager.getTrackUrl(bestMatch)
+      return { newTrack: { info: bestMatch }, ...stream }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       logger('error', 'Shazam', `Failed to get track URL: ${message}`)
@@ -1281,28 +1271,6 @@ export default class ShazamSource {
       typeof author === 'string' &&
       typeof length === 'number' &&
       typeof uri === 'string'
-    )
-  }
-
-  /**
-   * Maps a scored best-match candidate back to the original encoded track
-   * payload returned by the search pipeline.
-   *
-   * @param tracks Candidate encoded tracks.
-   * @param candidate Best-match candidate selected by the scoring helper.
-   * @returns The original encoded track payload or `null` when no exact match exists.
-   */
-  private findTrackDataByCandidate(
-    tracks: ShazamTrackData[],
-    candidate: BestMatchCandidate
-  ): ShazamTrackData | null {
-    return (
-      tracks.find(
-        (track) =>
-          track.info.title === candidate.info.title &&
-          track.info.author === candidate.info.author &&
-          track.info.uri === candidate.info.uri
-      ) ?? null
     )
   }
 

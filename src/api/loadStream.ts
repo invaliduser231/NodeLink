@@ -821,7 +821,8 @@ async function handler(
     const { createAudioResource, createSeekeableAudioResource } =
       await getStreamProcessorModule()
     const streamProcessorRuntime = getStreamProcessorRuntime(runtime)
-    const sourceName = decodedTrack.info.sourceName
+    const sourceName =
+      urlResult.newTrack?.info?.sourceName ?? decodedTrack.info.sourceName
     const isHls = urlResult.protocol === 'hls'
     const isSabr = urlResult.protocol === 'sabr'
     const isLocal = sourceName === 'local'

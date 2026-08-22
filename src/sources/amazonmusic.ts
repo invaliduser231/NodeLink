@@ -10,7 +10,6 @@ import type {
 } from '../typings/sources/source.types.ts'
 import {
   encodeTrack,
-  getBestMatch,
   http1makeRequest,
   logger
 } from '../utils.ts'
@@ -1054,19 +1053,13 @@ export default class AmazonMusicSource implements SourceInstance {
    * @public
    */
   public async getTrackUrl(decodedTrack: TrackInfo): Promise<TrackUrlResult> {
-    const query = `${decodedTrack.title} ${decodedTrack.author}`
     const sources = this.nodelink.sources
     if (!sources) {
       return {
         exception: { message: 'Sources not available.', severity: 'fault' }
       }
     }
-    const searchResult = await sources.searchWithDefault(
-      decodedTrack.isrc ? `"${decodedTrack.isrc}"` : query
-    )
-    const candidates =
-      searchResult.loadType === 'search' ? searchResult.data : []
-    const bestMatch = getBestMatch(candidates, decodedTrack)
+    const bestMatch = await sources.mirrorTrack(decodedTrack)
 
     if (!bestMatch) {
       return {
@@ -1076,11 +1069,9 @@ export default class AmazonMusicSource implements SourceInstance {
         }
       }
     }
-    const trackUrl = await sources.getTrackUrl(
-      bestMatch.info as unknown as TrackInfo
-    )
+    const trackUrl = await sources.getTrackUrl(bestMatch)
     return {
-      newTrack: { info: bestMatch.info as unknown as TrackInfo },
+      newTrack: { info: bestMatch },
       ...trackUrl
     }
   }

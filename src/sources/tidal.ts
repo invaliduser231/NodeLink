@@ -13,12 +13,10 @@ import type {
   WorkerNodeLink
 } from '../typings/sources/source.types.ts'
 import type {
-  BestMatchCandidate,
   TrackEncodeInput
 } from '../typings/utils.types.ts'
 import {
   encodeTrack,
-  getBestMatch,
   http1makeRequest,
   logger,
   makeRequest
@@ -370,9 +368,9 @@ export default class TidalSource {
         'Tidal',
         `Falling back to default search mirror for: ${decodedTrack.title}`
       )
-      const query = `${decodedTrack.title} ${decodedTrack.author}`
 
-      if (!this.nodelink.sources) {
+      const sourceManager = this.nodelink.sources
+      if (!sourceManager) {
         return {
           exception: {
             message: 'Default source search is not available.',
@@ -381,64 +379,12 @@ export default class TidalSource {
         }
       }
 
-      let searchResult = await this.nodelink.sources.searchWithDefault(
-        decodedTrack.isrc ? `"${decodedTrack.isrc}"` : query
-      )
-
-      if (
-        searchResult.loadType !== 'search' ||
-        searchResult.data.length === 0
-      ) {
-        searchResult = await this.nodelink.sources.searchWithDefault(query)
-      }
-
-      if (
-        searchResult.loadType !== 'search' ||
-        searchResult.data.length === 0
-      ) {
+      const fallbackTrack = await sourceManager.mirrorTrack(decodedTrack)
+      if (!fallbackTrack) {
         return {
           exception: {
             message: 'No matching track found on default source.',
             severity: 'common'
-          }
-        }
-      }
-
-      const tracks = this.toTrackInfoArray(searchResult.data)
-      const candidates: BestMatchCandidate[] = tracks.map((track) => ({
-        info: track
-      }))
-      const bestMatch = getBestMatch(candidates, decodedTrack)
-      if (!bestMatch) {
-        return {
-          exception: {
-            message: 'No suitable alternative found after filtering.',
-            severity: 'common'
-          }
-        }
-      }
-
-      const fallbackTrack = tracks.find(
-        (track) =>
-          track.title === bestMatch.info.title &&
-          track.author === bestMatch.info.author &&
-          track.length === bestMatch.info.length
-      )
-      if (!fallbackTrack) {
-        return {
-          exception: {
-            message: 'No suitable alternative found after filtering.',
-            severity: 'common'
-          }
-        }
-      }
-
-      const sourceManager = this.nodelink.sources
-      if (!sourceManager) {
-        return {
-          exception: {
-            message: 'Source manager is not available.',
-            severity: 'fault'
           }
         }
       }

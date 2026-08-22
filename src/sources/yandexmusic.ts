@@ -22,7 +22,6 @@ import type {
 } from '../typings/sources/yandexmusic.types.ts'
 import {
   encodeTrack,
-  getBestMatch,
   http1makeRequest,
   logger
 } from '../utils.ts'
@@ -1122,29 +1121,16 @@ export default class YandexMusicSource implements SourceInstance {
     originalError: Error
   ): Promise<TrackUrlResult> {
     try {
-      const query = `${decodedTrack.title} ${decodedTrack.author}`.trim()
       const sm = this.nodelink.sources
       if (!sm) throw originalError
 
-      let res = await sm.searchWithDefault(
-        decodedTrack.isrc ? `"${decodedTrack.isrc}"` : query
-      )
-
-      if (res.loadType !== 'search' || !res.data.length) {
-        res = await sm.searchWithDefault(query)
-      }
-
-      if (res.loadType !== 'search' || !res.data.length) {
-        throw originalError
-      }
-
-      const best = getBestMatch(res.data, decodedTrack, {
+      const best = await sm.mirrorTrack(decodedTrack, {
         allowExplicit: this.allowExplicit
       })
       if (!best) throw originalError
 
-      const stream = await sm.getTrackUrl(best.info as TrackInfo)
-      return { newTrack: { info: best.info as TrackInfo }, ...stream }
+      const stream = await sm.getTrackUrl(best)
+      return { newTrack: { info: best }, ...stream }
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e)
       return { exception: { message, severity: 'fault' } }

@@ -585,6 +585,13 @@ export interface SourceManager {
   unifiedSearch: (query: string) => Promise<SourceResult>
   /** Search using default search source */
   searchWithDefault: (query: string) => Promise<SourceResult>
+  /** Look a recording up by ISRC on sources that index ISRCs */
+  searchByIsrc: (isrc: string) => Promise<TrackInfo | null>
+  /** Resolve a verified playable stand-in for a track its source cannot stream */
+  mirrorTrack: (
+    track: TrackInfo,
+    options?: { allowExplicit?: boolean }
+  ) => Promise<TrackInfo | null>
   /** Get track URL */
   getTrackUrl: (
     track: TrackInfo | TrackInfoExtended,

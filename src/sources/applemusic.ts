@@ -8,7 +8,7 @@ import type {
   TrackUrlResult,
   WorkerNodeLink
 } from '../typings/sources/source.types.ts'
-import { encodeTrack, getBestMatch, http1makeRequest } from '../utils.ts'
+import { encodeTrack, http1makeRequest } from '../utils.ts'
 
 /**
  * Metadata for Apple Music catalog resource attributes.
@@ -739,11 +739,6 @@ export default class AppleMusicSource implements SourceInstance {
    * @public
    */
   public async getTrackUrl(decodedTrack: TrackInfo): Promise<TrackUrlResult> {
-    const isExplicit = decodedTrack.uri?.includes('explicit=true')
-    let query = `${decodedTrack.title} ${decodedTrack.author}`
-    if (isExplicit)
-      query += this.allowExplicit ? ' official video' : ' clean version'
-
     const sources = this.nodelink.sources
     if (!sources) {
       return {
@@ -751,12 +746,7 @@ export default class AppleMusicSource implements SourceInstance {
       }
     }
 
-    const searchResult = await sources.searchWithDefault(
-      decodedTrack.isrc ? `"${decodedTrack.isrc}"` : query
-    )
-    const candidates =
-      searchResult.loadType === 'search' ? searchResult.data : []
-    const bestMatch = getBestMatch(candidates, decodedTrack, {
+    const bestMatch = await sources.mirrorTrack(decodedTrack, {
       allowExplicit: this.allowExplicit
     })
 
@@ -766,11 +756,9 @@ export default class AppleMusicSource implements SourceInstance {
       }
     }
 
-    const stream = await sources.getTrackUrl(
-      bestMatch.info as unknown as TrackInfo
-    )
+    const stream = await sources.getTrackUrl(bestMatch)
     return {
-      newTrack: { info: bestMatch.info as unknown as TrackInfo },
+      newTrack: { info: bestMatch },
       ...stream
     }
   }

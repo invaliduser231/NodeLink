@@ -614,6 +614,14 @@ interface DeezerSourceManager {
   searchWithDefault: (query: string) => Promise<SourceResult>
 
   /**
+   * Resolves a verified playable stand-in for a track that cannot be streamed.
+   */
+  mirrorTrack: (
+    track: TrackInfo,
+    options?: { allowExplicit?: boolean }
+  ) => Promise<TrackInfo | null>
+
+  /**
    * Resolves a playable URL for a delegated track.
    */
   getTrackUrl: (track: TrackInfo) => Promise<TrackUrlResult>
@@ -1158,20 +1166,7 @@ export default class DeezerSource {
       )
     }
 
-    const query = `${decodedTrack.title} ${decodedTrack.author}`
-    let searchResult = await sourceManager.searchWithDefault(
-      decodedTrack.isrc ? `"${decodedTrack.isrc}"` : query
-    )
-
-    if (this.extractTrackData(searchResult).length === 0) {
-      searchResult = await sourceManager.searchWithDefault(query)
-    }
-
-    const candidates = this.extractTrackData(searchResult)
-    const bestMatch = getBestMatch(
-      candidates,
-      decodedTrack
-    ) as DeezerTrackData | null
+    const bestMatch = await sourceManager.mirrorTrack(decodedTrack)
 
     if (!bestMatch) {
       return this.createException(
@@ -1181,8 +1176,8 @@ export default class DeezerSource {
       )
     }
 
-    const streamInfo = await sourceManager.getTrackUrl(bestMatch.info)
-    return { newTrack: bestMatch, ...streamInfo }
+    const streamInfo = await sourceManager.getTrackUrl(bestMatch)
+    return { newTrack: { info: bestMatch }, ...streamInfo }
   }
 
   /**
