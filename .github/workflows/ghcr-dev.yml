@@ -5,8 +5,26 @@ name: Build dev image (ghcr)
       - dev
   workflow_dispatch: null
 jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+      - name: Test
+        run: npm test
+
   build:
     name: Build and push dev image
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -28,4 +46,6 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64
-          tags: 'ghcr.io/${{ github.repository_owner }}/nodelink:dev'
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/nodelink:dev
+            ghcr.io/${{ github.repository_owner }}/nodelink:sha-${{ github.sha }}
