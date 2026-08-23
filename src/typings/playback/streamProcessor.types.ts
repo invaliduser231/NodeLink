@@ -41,6 +41,8 @@ export interface AudioConstants {
   maxDecodesPerTick: number
   /** Interval in milliseconds between decode ticks. */
   decodeIntervalMs: number
+  /** Safety net before a held input callback is released anyway. */
+  inputResumeTimeoutMs: number
 }
 
 /**

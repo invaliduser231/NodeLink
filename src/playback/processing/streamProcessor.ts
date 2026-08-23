@@ -121,7 +121,8 @@ const AAC_BUFFER_SIZE: number = parsePositiveIntEnv(
 const AUDIO_CONSTANTS: AudioConstants = Object.freeze({
   pcmFloatFactor: 32767,
   maxDecodesPerTick: 5,
-  decodeIntervalMs: 10
+  decodeIntervalMs: 10,
+  inputResumeTimeoutMs: 5000
 })
 
 const MPEGTS_CONFIG: MpegtsConfig = Object.freeze({
@@ -1032,6 +1033,8 @@ class SymphoniaDecoderStream extends Transform {
   private _loggedFormat: boolean
   private _decodedBytes: number
   private _decodeCalls: number
+  private _pendingInputCallback: TransformCallback | null
+  private _pendingInputTimer: ReturnType<typeof setTimeout> | null
 
   constructor(options: SymphoniaDecoderStreamOptions = {}) {
     const { codecRegistryHint, ...streamOptions } = options
@@ -1058,6 +1061,8 @@ class SymphoniaDecoderStream extends Transform {
     this._loggedFormat = false
     this._decodedBytes = 0
     this._decodeCalls = 0
+    this._pendingInputCallback = null
+    this._pendingInputTimer = null
   }
 
   _ensureResampler(sampleRate: number): void {
@@ -1125,6 +1130,7 @@ class SymphoniaDecoderStream extends Transform {
       clearImmediate(this._immediateId)
       this._immediateId = null
     }
+    this._releaseInput()
   }
 
   _isDecoderValid(): boolean {
@@ -1147,14 +1153,46 @@ class SymphoniaDecoderStream extends Transform {
         this.decoder.initialize(this.codecRegistryHint)
       }
       this._scheduleDecode()
+
+      if (this.readableLength >= this.readableHighWaterMark) {
+        this._holdInput(callback)
+        return
+      }
+
       callback()
     } catch (err) {
       callback(err as Error)
     }
   }
 
+  _holdInput(callback: TransformCallback): void {
+    this._releaseInput()
+    this._pendingInputCallback = callback
+    this._pendingInputTimer = setTimeout(() => {
+      this._pendingInputTimer = null
+      this._releaseInput()
+    }, AUDIO_CONSTANTS.inputResumeTimeoutMs)
+    this._pendingInputTimer.unref?.()
+  }
+
+  _releaseInput(): void {
+    if (this._pendingInputTimer) {
+      clearTimeout(this._pendingInputTimer)
+      this._pendingInputTimer = null
+    }
+
+    const callback = this._pendingInputCallback
+    if (!callback) return
+    this._pendingInputCallback = null
+    callback()
+  }
+
   override _read(_size: number): void {
     super._read(_size)
+
+    if (this.readableLength < this.readableHighWaterMark) {
+      this._releaseInput()
+    }
 
     if (this._isDecoderValid()) {
       this._scheduleDecode()
