@@ -125,6 +125,12 @@ export interface YouTubeSourceConfig {
   /** Ordered list of alternative sources tried if YouTube resolution fails. */
   fallbackSources: string[]
 
+  /**
+   * Prefer WebM/Opus audio over M4A when both are offered.
+   * WebM streams without a trailing index, so very long videos start reliably.
+   */
+  preferWebmAudio: boolean
+
   /** Configuration for InnerTube clients. */
   clients: {
     /** Ordered priority of clients used for search. */

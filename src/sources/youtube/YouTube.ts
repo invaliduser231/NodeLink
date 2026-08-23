@@ -1341,9 +1341,7 @@ export default class YouTubeSource {
 
         if (urlData.protocol === 'sabr') {
           this.reportProxyStatus(proxyToUse, true, 200, proxyLatency)
-          const bestAudio = urlData.formats
-            ?.filter((f) => f.mimeType?.includes('audio'))
-            .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0]
+          const bestAudio = this._pickBestAudioFormat(urlData.formats)
 
           if (bestAudio) {
             urlData.format = bestAudio.mimeType?.includes('webm')
@@ -2036,9 +2034,7 @@ export default class YouTubeSource {
       if (!isDestroying && !stream.destroyed) sabr.cancelSeekHandoff()
     }
 
-    const bestAudio = (additionalData.formats ?? [])
-      .filter((f) => f.mimeType?.includes('audio'))
-      .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0]
+    const bestAudio = this._pickBestAudioFormat(additionalData.formats)
 
     if (!bestAudio) {
       stream.destroy(new Error('No audio format available in SABR stream'))
@@ -2052,6 +2048,27 @@ export default class YouTubeSource {
     await ready
     return { stream, type }
   }
+  /**
+   * Picks the audio format to stream, preferring WebM/Opus when offered.
+   * @remarks M4A carries its index in a trailing moov box, which very long
+   * videos fail to expose in time. WebM stays playable regardless of length.
+   * @param formats - Candidate formats reported by the client.
+   */
+  private _pickBestAudioFormat<
+    T extends { mimeType?: string; bitrate?: number }
+  >(formats: T[] | undefined | null): T | undefined {
+    const audio = (formats ?? []).filter((f) => f.mimeType?.includes('audio'))
+    if (audio.length === 0) return undefined
+
+    const byBitrate = (a: T, b: T) => (b.bitrate || 0) - (a.bitrate || 0)
+    if (this.config?.preferWebmAudio === false) {
+      return [...audio].sort(byBitrate)[0]
+    }
+
+    const webm = audio.filter((f) => f.mimeType?.includes('webm'))
+    return [...(webm.length > 0 ? webm : audio)].sort(byBitrate)[0]
+  }
+
   /**
    * Creates an HLS stream handler for the given manifest URL.
    *

@@ -307,6 +307,7 @@ export const config: NodelinkConfig = {
       gl: 'US',
       proxies: [],
       mirrorOfficialAlbums: false,
+      preferWebmAudio: true,
       fallbackSources: [
         'soundcloud',
         'deezer',
