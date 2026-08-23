@@ -200,9 +200,13 @@ if (isMainThread) {
     1,
     specConfig.microWorkers ?? Math.min(2, os.cpus().length)
   )
-  const initialThreadCount = 1
+  const configuredInitialThreads = specConfig.initialMicroWorkers ?? 0
+  const initialThreadCount =
+    configuredInitialThreads > 0
+      ? Math.min(maxThreadCount, configuredInitialThreads)
+      : maxThreadCount
   const TASKS_PER_WORKER = specConfig.tasksPerWorker ?? 32
-  const SCALE_UP_THRESHOLD = specConfig.scaleUpThreshold ?? 30
+  const SCALE_UP_THRESHOLD = specConfig.scaleUpThreshold ?? 4
   const SCALE_UP_COOLDOWN_MS = specConfig.scaleCooldownMs ?? 1000
   const workerPool: MicroWorker[] = []
   const taskQueue = createHeadQueue<TaskData>()

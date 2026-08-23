@@ -235,7 +235,7 @@ class SourceWorkerManager {
       nodelink.options.cluster?.specializedSourceWorker?.count || 1
     )
     this.scaleUpThreshold =
-      nodelink.options.cluster?.specializedSourceWorker?.scaleUpThreshold || 30
+      nodelink.options.cluster?.specializedSourceWorker?.scaleUpThreshold || 4
     this.scaleCooldownMs =
       nodelink.options.cluster?.specializedSourceWorker?.scaleCooldownMs || 1500
     this.lastScaleUpAt = 0

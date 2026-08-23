@@ -40,6 +40,8 @@ export enum FrameType {
 export interface SourceWorkerConfig {
   /** Number of micro-workers to spawn per source worker */
   microWorkers?: number
+  /** Micro-workers started upfront. 0 starts all of them. */
+  initialMicroWorkers?: number
   /** Maximum tasks per micro-worker before queuing */
   tasksPerWorker?: number
   /** Queue/load threshold per active micro-worker to trigger scaling up */

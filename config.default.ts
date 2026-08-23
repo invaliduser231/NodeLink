@@ -24,7 +24,10 @@ export const config: NodelinkConfig = {
       enabled: true,
       count: 1,
       microWorkers: 2,
+      initialMicroWorkers: 0,
       tasksPerWorker: 32,
+      scaleUpThreshold: 4,
+      scaleCooldownMs: 1000,
       silentLogs: true
     },
     timeouts: {

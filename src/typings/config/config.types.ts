@@ -1034,7 +1034,12 @@ export interface ClusterSection {
     enabled: boolean
     count: number
     microWorkers: number
+    /** Threads started upfront. 0 starts every configured micro-worker. */
+    initialMicroWorkers: number
     tasksPerWorker: number
+    /** Queued tasks required before another worker spawns. */
+    scaleUpThreshold: number
+    scaleCooldownMs: number
     silentLogs: boolean
   }
 
