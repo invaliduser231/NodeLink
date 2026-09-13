@@ -297,6 +297,22 @@ export class PoTokenManager {
     hadNavigator: boolean
   } | null = null
   private _idleTimer: NodeJS.Timeout | null = null
+  private _chain: Promise<unknown> = Promise.resolve()
+
+  /**
+   * Runs a task once every previously queued one has settled. BotGuard needs
+   * browser globals on globalThis, so two overlapping runs would tear down
+   * each other's window while the other is still awaiting the network.
+   * @internal
+   */
+  private _serialize<T>(task: () => Promise<T>): Promise<T> {
+    const run = this._chain.then(task, task)
+    this._chain = run.then(
+      () => undefined,
+      () => undefined
+    )
+    return run
+  }
 
   /**
    * Refreshes the idle timeout for NativeDOM resources.
@@ -311,7 +327,7 @@ export class PoTokenManager {
           'PoToken',
           'Idle timeout reached. Cleaning up NativeDOM resources.'
         )
-        this.reset()
+        void this._serialize(async () => this.reset())
       },
       10 * 60 * 1000
     )
@@ -613,6 +629,21 @@ export class PoTokenManager {
     visitorData: string | null
     legacyPoToken: string | null
   }> {
+    return this._serialize(() => this._generate(videoId, existingVisitorData))
+  }
+
+  /**
+   * Generates tokens. Always entered through the serialized queue.
+   * @internal
+   */
+  private async _generate(
+    videoId: string,
+    existingVisitorData?: string
+  ): Promise<{
+    poToken: string | null
+    visitorData: string | null
+    legacyPoToken: string | null
+  }> {
     try {
       logger(
         'debug',
@@ -732,6 +763,14 @@ export class PoTokenManager {
    * @public
    */
   public async generateStreamingToken(): Promise<string | null> {
+    return this._serialize(() => this._generateStreamingToken())
+  }
+
+  /**
+   * Generates a streaming token. Always entered through the serialized queue.
+   * @internal
+   */
+  private async _generateStreamingToken(): Promise<string | null> {
     try {
       await this.initialize()
       if (!this.minter || !this.visitorData)
