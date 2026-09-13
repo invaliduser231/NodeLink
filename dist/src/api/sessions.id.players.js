@@ -513,15 +513,6 @@ async function applyPlayerPatch(runtime, session, guildId, payload, query) {
     const trackToPlay = await resolvePlayPayload(runtime, payload.track);
     const stopPlayer = trackToPlay === null;
     const shouldClearNextTrack = payload.nextTrack === null || payload.nextTrack?.encoded === null;
-    if (shouldClearNextTrack) {
-        await session.players.clearNextTrack(guildId);
-    }
-    else if (payload.nextTrack) {
-        const trackToPreload = await resolvePreloadPayload(runtime, payload.nextTrack);
-        if (trackToPreload) {
-            await session.players.preload(guildId, trackToPreload);
-        }
-    }
     if (stopPlayer) {
         await session.players.stop(guildId);
     }
@@ -534,6 +525,15 @@ async function applyPlayerPatch(runtime, session, guildId, payload, query) {
             endTime: payload.endTime ?? undefined
         });
     }
+    if (shouldClearNextTrack) {
+        await session.players.clearNextTrack(guildId);
+    }
+    else if (payload.nextTrack) {
+        const trackToPreload = await resolvePreloadPayload(runtime, payload.nextTrack);
+        if (trackToPreload) {
+            await session.players.preload(guildId, trackToPreload);
+        }
+    }
     if (payload.volume !== undefined) {
         await session.players.volume(guildId, payload.volume);
     }
@@ -544,8 +544,8 @@ async function applyPlayerPatch(runtime, session, guildId, payload, query) {
         await session.players.seek(guildId, payload.position);
     }
     if (payload.endTime !== undefined) {
-        const playerState = await session.players.toJSON(guildId);
-        await session.players.seek(guildId, playerState.state.position, payload.endTime ?? undefined);
+        const playerState = await session.players.toJSON(guildId, true);
+        await session.players.seek(guildId, playerState.state.position, payload.endTime);
     }
     if (payload.filters !== undefined) {
         await session.players.setFilters(guildId, payload.filters);
@@ -562,7 +562,7 @@ async function applyPlayerPatch(runtime, session, guildId, payload, query) {
     if (payload.ducking !== undefined) {
         await session.players.setDucking(guildId, payload.ducking);
     }
-    return await session.players.toJSON(guildId);
+    return await session.players.toJSON(guildId, true);
 }
 /**
  * Handles requests for the players route.

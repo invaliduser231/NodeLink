@@ -945,6 +945,9 @@ export interface ServerSection {
 
   /** Enable experimental Bun server engine. */
   useBunServer: boolean
+
+  /** Allow browser web players from any origin (permissive CORS). */
+  cors: boolean
 }
 
 /**

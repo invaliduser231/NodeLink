@@ -4,7 +4,6 @@ import type { SabrStreamConfig } from '../../typings/sources/sabr.types.ts'
 import type {
   SourceResult,
   TrackInfo,
-  TrackUrlResult,
   WorkerNodeLink
 } from '../../typings/sources/source.types.ts'
 import type {
@@ -213,6 +212,15 @@ export default class YouTubeSource {
 
   /** Map of active download streams keyed by a unique symbol or string, used for cancellation. */
   private activeStreams: Map<string | symbol, CancelSignal>
+  /** SABR streams tracked for guild-aware abort when a player is destroyed. */
+  private activeSabrStreams: Map<
+    string | symbol,
+    {
+      guildId?: string
+      sabr: { destroy: (err?: Error) => void }
+      stream: PassThrough
+    }
+  > = new Map()
 
   /** Set of fallback-mirror lookup keys currently in flight, used to prevent infinite recursion loops. */
   private mirrorFallbackInFlight: Set<string>
@@ -374,7 +382,7 @@ export default class YouTubeSource {
     )
 
     await this._fetchVisitorData()
-    await this.cipherManager.getCachedPlayerScript()
+    await this._loadPlayerScriptWithRetry()
 
     if (this.visitorDataInterval) clearInterval(this.visitorDataInterval)
     this.visitorDataInterval = setInterval(
@@ -395,6 +403,38 @@ export default class YouTubeSource {
   }
 
   /**
+   * Loads the player script with retries, tolerating transient rate limits
+   * (HTTP 429) during startup bursts. Failure never blocks source
+   * initialization; the script is re-fetched lazily on the next cipher
+   * operation.
+   * @internal
+   */
+  private async _loadPlayerScriptWithRetry(): Promise<void> {
+    const maxAttempts = 3
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.cipherManager.getCachedPlayerScript()
+        return
+      } catch (e) {
+        logger(
+          'warn',
+          'YouTube',
+          `Player script load failed (attempt ${attempt}/${maxAttempts}): ${(e as Error).message}`
+        )
+        if (attempt === maxAttempts) {
+          logger(
+            'warn',
+            'YouTube',
+            'Continuing without a cached player script; it will be fetched lazily.'
+          )
+          return
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt))
+      }
+    }
+  }
+
+  /**
    * Tears down the YouTube source by aborting active streams, clearing
    * the visitor data interval, and cleaning up OAuth and cipher resources.
    */
@@ -405,6 +445,15 @@ export default class YouTubeSource {
       cancelSignal.aborted = true
     }
     this.activeStreams.clear()
+    for (const [, entry] of this.activeSabrStreams.entries()) {
+      try {
+        entry.stream.destroy()
+      } catch {}
+      try {
+        entry.sabr.destroy()
+      } catch {}
+    }
+    this.activeSabrStreams.clear()
 
     if (this.visitorDataInterval) {
       clearInterval(this.visitorDataInterval)
@@ -420,6 +469,29 @@ export default class YouTubeSource {
     ;(this.cipherManager as { cleanup?: () => void })?.cleanup?.()
     this.failingClientsByTrack.clear()
   }
+
+  /**
+   * Aborts all SABR streams for a guild (called on player destroy to stop
+   * background analysis windows that would otherwise keep stalling on 403s).
+   * @internal
+   */
+  public abortGuildStreams(guildId: string): void {
+    for (const [key, entry] of this.activeSabrStreams.entries()) {
+      if (entry.guildId !== guildId) continue
+      try {
+        entry.stream.destroy()
+      } catch {}
+      try {
+        entry.sabr.destroy()
+      } catch {}
+      this.activeSabrStreams.delete(key)
+      const cancel = this.activeStreams.get(key)
+      if (cancel) {
+        cancel.aborted = true
+        this.activeStreams.delete(key)
+      }
+    }
+  }
   /**
    * Fetches visitor data and player script URL from YouTube embed pages.
    *
@@ -432,7 +504,7 @@ export default class YouTubeSource {
   private async _fetchVisitorData(): Promise<void> {
     // this should prevent the visitorData getting initialized twice.
     if (process.env.WORKER_TYPE === 'source') return
-    
+
     const cachedPlayerScript = this.nodelink.credentialManager?.get<string>(
       'yt_player_script_url'
     )
@@ -445,42 +517,34 @@ export default class YouTubeSource {
     let playerScriptUrl: string | null = null
 
     try {
-      const { body, error, statusCode } = await makeRequest(
-        'https://youtubei.googleapis.com/youtubei/v1/visitor_id?key=AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w',
+      const { body, error, statusCode } = await http1makeRequest(
+        'https://music.youtube.com/sw.js_data',
         {
-          method: 'POST',
-          body: {
-            context: {
-              client: {
-                clientName: 'ANDROID',
-                clientVersion: '20.01.35'
-              }
-            }
-          },
+          method: 'GET',
+          responseType: 'buffer',
           disableBodyCompression: true
         }
       )
+      if (!error && statusCode === 200) {
+        const text = (body as Buffer).toString('utf-8')
+        const json = text.slice(text.indexOf('\n') + 1)
+        const visitorData = this._extractVisitorData(JSON.parse(json))
 
-      const data = body as {
-        responseContext?: {
-          visitorData?: string
+        if (visitorData) {
+          this.ytContext.client.visitorData = visitorData
+          visitorFound = true
+          logger(
+            'debug',
+            'YouTube',
+            `visitorData obtained from sw.js_data endpoint (len=${visitorData.length})`
+          )
         }
-      }
-
-      if (!error && statusCode === 200 && data?.responseContext?.visitorData) {
-        this.ytContext.client.visitorData = data.responseContext.visitorData
-        visitorFound = true
-        logger(
-          'debug',
-          'YouTube',
-          `visitorData obtained from visitor_id endpoint (len=${data.responseContext.visitorData.length})`
-        )
       }
     } catch (e) {
       logger(
         'debug',
         'YouTube',
-        `visitor_id endpoint failed: ${(e as Error).message}`
+        `sw.js_data endpoint failed: ${(e as Error).message}`
       )
     }
     if (!visitorFound) {
@@ -574,6 +638,28 @@ export default class YouTubeSource {
 
     if (playerScriptUrl) this.cipherManager.setPlayerScriptUrl(playerScriptUrl)
   }
+
+  /**
+   * Recursively searches the parsed `sw.js_data` payload for the visitor data
+   * token. The token is a protobuf-encoded base64 string embedded somewhere in
+   * the nested response arrays, so its exact position cannot be relied upon.
+   * @param node - Current payload node (array or string) being inspected.
+   * @returns The visitor data token, or `null` when not found.
+   * @internal
+   */
+  private _extractVisitorData(node: unknown): string | null {
+    if (typeof node === 'string') {
+      return /^Cg[A-Za-z0-9+/=_%-]{100,}$/.test(node) ? node : null
+    }
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const found = this._extractVisitorData(child)
+        if (found) return found
+      }
+    }
+    return null
+  }
+
   /**
    * Searches YouTube for tracks, playlists, or recommendations.
    *
@@ -801,14 +887,18 @@ export default class YouTubeSource {
       url.includes('list=OLAK') &&
       result.loadType === 'playlist'
     ) {
-      const tracks = (result.data as { tracks?: Array<{ info: TrackInfo; encoded: string }> })
-        ?.tracks
+      const tracks = (
+        result.data as { tracks?: Array<{ info: TrackInfo; encoded: string }> }
+      )?.tracks
       if (tracks) {
         for (const track of tracks) {
           if (track.info && !track.info.uri.includes('olak=true')) {
             const separator = track.info.uri.includes('?') ? '&' : '?'
             track.info.uri += `${separator}olak=true`
-            track.encoded = encodeTrack({ ...track.info, details: [] } as TrackEncodeInput)
+            track.encoded = encodeTrack({
+              ...track.info,
+              details: []
+            } as TrackEncodeInput)
           }
         }
       }
@@ -821,7 +911,10 @@ export default class YouTubeSource {
    * Internal worker for URL resolution.
    * @internal
    */
-  private async _resolveWorker(url: string, type?: string): Promise<SourceResult> {
+  private async _resolveWorker(
+    url: string,
+    type?: string
+  ): Promise<SourceResult> {
     const liveMatch = url.match(
       /^https?:\/\/(?:www\.)?youtube\.com\/live\/([\w-]+)/
     )
@@ -1202,8 +1295,12 @@ export default class YouTubeSource {
     forceRefresh = false
   ): Promise<TrackUrlData> {
     if (decodedTrack.uri?.includes('olak=true')) {
-      logger('debug', 'YouTube', `Resolving mirrored audio track for official album: ${decodedTrack.identifier}`)
-      
+      logger(
+        'debug',
+        'YouTube',
+        `Resolving mirrored audio track for official album: ${decodedTrack.identifier}`
+      )
+
       let searchTitle = decodedTrack.title
       let searchAuthor = decodedTrack.author
       if (searchTitle.includes(' - ')) {
@@ -1215,26 +1312,39 @@ export default class YouTubeSource {
       }
 
       const query = `${searchAuthor} ${searchTitle}`
-      const searchTrack = { ...decodedTrack, title: searchTitle, author: searchAuthor }
-      
+      const searchTrack = {
+        ...decodedTrack,
+        title: searchTitle,
+        author: searchAuthor
+      }
+
       try {
         const res = await this.search(query, 'ytmsearch')
         if (res.loadType === 'search' && res.data.length) {
           const best = getBestMatch(res.data, searchTrack)
           if (best) {
-            const urlData = await this.getTrackUrl(best.info as TrackInfo, itag, forceRefresh)
+            const urlData = await this.getTrackUrl(
+              best.info as TrackInfo,
+              itag,
+              forceRefresh
+            )
             return {
               newTrack: { info: best.info as TrackInfo },
               url: urlData.url,
               protocol: urlData.protocol,
-              format: typeof urlData.format === 'string' ? urlData.format : undefined,
+              format:
+                typeof urlData.format === 'string' ? urlData.format : undefined,
               additionalData: urlData.additionalData,
               exception: urlData.exception as TrackUrlData['exception']
             }
           }
         }
       } catch (e) {
-        logger('warn', 'YouTube', `Failed to mirror OLAK track ${decodedTrack.identifier}: ${(e as Error).message}`)
+        logger(
+          'warn',
+          'YouTube',
+          `Failed to mirror OLAK track ${decodedTrack.identifier}: ${(e as Error).message}`
+        )
       }
     }
     if (!forceRefresh) {
@@ -1349,6 +1459,13 @@ export default class YouTubeSource {
               : 'm4a'
           }
 
+          if (urlData.additionalData) {
+            ;(urlData.additionalData as TrackUrlAdditionalData).client =
+              clientName
+          } else {
+            urlData.additionalData = { client: clientName }
+          }
+
           return urlData
         }
 
@@ -1401,7 +1518,8 @@ export default class YouTubeSource {
                 contentLength,
                 proxy: proxyToUse,
                 itag: urlData.itag,
-                formats: urlData.formats
+                formats: urlData.formats,
+                client: clientName
               }
             }
             this.nodelink.trackCacheManager?.set(
@@ -1463,7 +1581,11 @@ export default class YouTubeSource {
               const result: TrackUrlData = {
                 url: urlData.hlsUrl,
                 protocol: 'hls',
-                format: 'mpegts'
+                format: 'mpegts',
+                additionalData: {
+                  client: clientName,
+                  proxy: proxyToUse
+                }
               }
               this.nodelink.trackCacheManager?.set(
                 'youtube',
@@ -1514,7 +1636,11 @@ export default class YouTubeSource {
             const result: TrackUrlData = {
               url: urlData.hlsUrl,
               protocol: 'hls',
-              format: 'mpegts'
+              format: 'mpegts',
+              additionalData: {
+                client: clientName,
+                proxy: proxyToUse
+              }
             }
             this.nodelink.trackCacheManager?.set(
               'youtube',
@@ -1903,6 +2029,14 @@ export default class YouTubeSource {
     const sabr = new SabrStream(sabrConfig)
 
     const stream = new PassThrough()
+    const guildIdForStream = (
+      additionalData as unknown as Record<string, unknown>
+    ).guildId as string | undefined
+    this.activeSabrStreams.set(streamKey, {
+      guildId: guildIdForStream,
+      sabr: sabr as unknown as { destroy: (err?: Error) => void },
+      stream
+    })
     let readyResolved = false
     let readyResolve: () => void
     let readyReject: (err: Error) => void
@@ -1937,7 +2071,13 @@ export default class YouTubeSource {
     sabr.on(
       'stall',
       async (reason: string = 'starvation', recoveryGeneration?: number) => {
-        if (isRecovering || stream.destroyed || sabr.destroyed) return
+        if (
+          isRecovering ||
+          stream.destroyed ||
+          sabr.destroyed ||
+          _cancelSignal.aborted
+        )
+          return
 
         isRecovering = true
         const generation =
@@ -2010,9 +2150,11 @@ export default class YouTubeSource {
     stream.destroy = ((err?: Error) => {
       if (isDestroying) return stream
       isDestroying = true
+      _cancelSignal.aborted = true
       stream.removeListener('drain', onSabrDrain)
       sabr.destroy(err)
       this.activeStreams.delete(streamKey)
+      this.activeSabrStreams.delete(streamKey)
       originalDestroy(err)
       return stream
     }) as typeof stream.destroy
@@ -2020,9 +2162,11 @@ export default class YouTubeSource {
     stream.once('close', () => {
       if (isDestroying) return
       isDestroying = true
+      _cancelSignal.aborted = true
       stream.removeListener('drain', onSabrDrain)
       sabr.destroy()
       this.activeStreams.delete(streamKey)
+      this.activeSabrStreams.delete(streamKey)
     })
 
     ;(stream as unknown as Record<string, unknown>)._sabrStream = sabr
@@ -2723,6 +2867,10 @@ export default class YouTubeSource {
     let isBackpressured = false
     let totalBytesReceived = 0
     let currentItag = additionalData?.itag
+    let currentClient =
+      (additionalData?.client as string | undefined) || undefined
+    let consecutiveClientFailures = 0
+    let parkedForRecovery = false
     let availableFormats = additionalData?.formats || []
     const failedItags = new Set<number>()
     let refreshAttempts = 0
@@ -2813,6 +2961,8 @@ export default class YouTubeSource {
 
     stream.on('drain', onDrain)
 
+    let totalContentLength = contentLength
+
     const refreshUrl = async (reason: string): Promise<string | null> => {
       if (isDestroyed || cancelSignal.aborted) return null
       if (++refreshAttempts > MAX_URL_REFRESH) {
@@ -2833,6 +2983,7 @@ export default class YouTubeSource {
       try {
         let itagToTry: number | null = null
         if (
+          totalBytesReceived === 0 &&
           currentItag &&
           failedItags.has(currentItag) &&
           availableFormats.length > 0
@@ -2860,28 +3011,75 @@ export default class YouTubeSource {
               `Switching to itag ${itagToTry} for "${decodedTrack.title}"`
             )
           }
+        } else if (totalBytesReceived > 0 && currentItag) {
+          itagToTry = currentItag
         }
 
-        const newUrlData = await this.getTrackUrl(decodedTrack, itagToTry, true)
+        if (consecutiveClientFailures >= 2 && currentClient) {
+          if (!this.failingClientsByTrack.has(decodedTrack.identifier)) {
+            this.failingClientsByTrack.set(decodedTrack.identifier, new Set())
+          }
+          this.failingClientsByTrack
+            .get(decodedTrack.identifier)
+            ?.add(currentClient)
+          logger(
+            'warn',
+            'YouTube',
+            `Client ${currentClient} failed repeatedly mid-stream for "${decodedTrack.title}". Rotating to next client in playback list...`
+          )
+          this.nodelink.trackCacheManager?.delete?.(
+            'youtube',
+            decodedTrack.identifier
+          )
+          consecutiveClientFailures = 0
+        }
+
+        let newUrlData = await this.getTrackUrl(decodedTrack, itagToTry, true)
+        if ((newUrlData.exception || !newUrlData.url) && itagToTry !== null) {
+          newUrlData = await this.getTrackUrl(decodedTrack, null, true)
+        }
         if (isDestroyed || cancelSignal.aborted) return null
         if (newUrlData.exception || !newUrlData.url) return null
 
-        currentUrl = newUrlData.url
         const newAd = newUrlData.additionalData as
           | TrackUrlAdditionalData
           | undefined
+        const newClient = (newAd?.client as string | undefined) || undefined
+        if (newClient) {
+          currentClient = newClient
+        }
+
+        if (
+          totalBytesReceived > 0 &&
+          newUrlData.itag &&
+          currentItag &&
+          newUrlData.itag !== currentItag
+        ) {
+          logger(
+            'warn',
+            'YouTube',
+            `Client rotation changed format (${currentItag} -> ${newUrlData.itag}) at ${totalBytesReceived} bytes for "${decodedTrack.title}". Parking stream so the player can seek-recover at the exact position on the next client...`
+          )
+          parkedForRecovery = true
+          return null
+        }
+
+        currentUrl = newUrlData.url
         currentProxy =
           (newAd?.proxy as unknown as HttpProxyConfig | undefined) ||
           currentProxy
         currentItag = newUrlData.itag || currentItag
         if (newUrlData.formats) availableFormats = newUrlData.formats
+        if (totalBytesReceived === 0 && newAd?.contentLength) {
+          totalContentLength = newAd.contentLength
+        }
         urlFetchTime = Date.now()
         consecutiveResets = 0
 
         logger(
           'debug',
           'YouTube',
-          `URL refreshed for "${decodedTrack.title}" (itag ${currentItag})`
+          `URL refreshed for "${decodedTrack.title}" (itag ${currentItag}, client: ${currentClient || 'unknown'})`
         )
         return currentUrl
       } catch (err) {
@@ -2913,12 +3111,14 @@ export default class YouTubeSource {
       while (
         !isDestroyed &&
         !cancelSignal.aborted &&
-        totalBytesReceived < contentLength
+        !parkedForRecovery &&
+        totalBytesReceived < totalContentLength
       ) {
         const urlAge = Date.now() - urlFetchTime
         if (urlAge > URL_MAX_AGE_MS) {
           const refreshed = await refreshUrl('URL age > 4.5h')
           if (!refreshed) {
+            if (parkedForRecovery) return
             cleanup(new Error('Failed to refresh expired URL'))
             return
           }
@@ -2935,7 +3135,10 @@ export default class YouTubeSource {
         )
 
         const start = totalBytesReceived
-        const end = Math.min(start + dynamicChunkSize - 1, contentLength - 1)
+        const end = Math.min(
+          start + dynamicChunkSize - 1,
+          totalContentLength - 1
+        )
         const rangeHeader = `bytes=${start}-${end}`
 
         try {
@@ -2981,15 +3184,45 @@ export default class YouTubeSource {
             result.error ||
             (result.statusCode !== 200 && result.statusCode !== 206)
           ) {
-            if (result.statusCode === 403 || result.statusCode === 404) {
+            if (result.statusCode === 416) {
+              if (totalBytesReceived > 0) {
+                logger(
+                  'debug',
+                  'YouTube',
+                  `HTTP 416 Range Not Satisfiable at ${totalBytesReceived}/${totalContentLength} bytes -- stream completed`
+                )
+                if (!stream.writableEnded) {
+                  stream.emit('finishBuffering')
+                  stream.end()
+                }
+                return
+              }
               logger(
                 'warn',
                 'YouTube',
-                `HTTP ${result.statusCode} for "${decodedTrack.title}" -- refreshing...`
+                `HTTP 416 at byte 0 for "${decodedTrack.title}" -- refreshing...`
               )
               if (currentItag) failedItags.add(currentItag)
+              const refreshed = await refreshUrl('HTTP 416')
+              if (refreshed) continue
+              if (parkedForRecovery) return
+              cleanup(new Error('HTTP 416: max URL refresh reached'))
+              return
+            }
+
+            if (result.statusCode === 403 || result.statusCode === 404) {
+              consecutiveClientFailures++
+              logger(
+                'warn',
+                'YouTube',
+                `HTTP ${result.statusCode} for "${decodedTrack.title}" (client: ${currentClient || 'unknown'}, failure #${consecutiveClientFailures}) -- refreshing...`
+              )
+              if (totalBytesReceived === 0 && currentItag) {
+                failedItags.add(currentItag)
+              }
               const refreshed = await refreshUrl(`HTTP ${result.statusCode}`)
               if (refreshed) continue
+              if (parkedForRecovery) return
               cleanup(
                 new Error(`HTTP ${result.statusCode}: max URL refresh reached`)
               )
@@ -3039,6 +3272,7 @@ export default class YouTubeSource {
             )
             const refreshed = await refreshUrl('invalid range response')
             if (refreshed) continue
+            if (parkedForRecovery) return
             cleanup(new Error('Invalid HTTP range response'))
             return
           }
@@ -3065,6 +3299,7 @@ export default class YouTubeSource {
                 responseStream.destroy()
                 return
               }
+              consecutiveClientFailures = 0
               if (dataStartTime === 0) dataStartTime = Date.now()
               bytesThisChunk += chunk.length
               totalBytesReceived += chunk.length
@@ -3121,11 +3356,11 @@ export default class YouTubeSource {
           logger(
             'debug',
             'YouTube',
-            `Chunk #${chunkCount} complete: ${bytesThisChunk} bytes in ${Date.now() - fetchStartTime}ms (${totalBytesReceived}/${contentLength} total, target=${targetSeconds}s)`
+            `Chunk #${chunkCount} complete: ${bytesThisChunk} bytes in ${Date.now() - fetchStartTime}ms (${totalBytesReceived}/${totalContentLength} total, target=${targetSeconds}s)`
           ) */
           // i was using this for debugging, so i will keep this commented incase i need it later.
 
-          if (totalBytesReceived >= contentLength) {
+          if (totalBytesReceived >= totalContentLength) {
             if (!stream.writableEnded) {
               stream.emit('finishBuffering')
               stream.end()
@@ -3186,6 +3421,7 @@ export default class YouTubeSource {
                 'multiple ECONNRESET on same URL'
               )
               if (refreshed) continue
+              if (parkedForRecovery) return
               cleanup(new Error('ECONNRESET: max URL refresh reached'))
               return
             } else {
@@ -3197,9 +3433,13 @@ export default class YouTubeSource {
             error.message?.includes('403') ||
             error.message?.includes('404')
           ) {
-            if (currentItag) failedItags.add(currentItag)
+            consecutiveClientFailures++
+            if (totalBytesReceived === 0 && currentItag) {
+              failedItags.add(currentItag)
+            }
             const refreshed = await refreshUrl('mid-stream 403/404')
             if (refreshed) continue
+            if (parkedForRecovery) return
             cleanup(new Error('mid-stream 403/404: max URL refresh reached'))
             return
           }

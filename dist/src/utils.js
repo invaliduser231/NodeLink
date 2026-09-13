@@ -430,7 +430,17 @@ function modifyPayload(nodelink, data) {
  * @public
  */
 function sendResponse(req, res, data, status, trace = false) {
+    const nodelink = runtime.nodelink;
+    const corsEnabled = nodelink?.options?.server?.cors === true;
     const headers = {
+        ...(corsEnabled
+            ? {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD',
+                'Access-Control-Allow-Headers': 'Authorization, Content-Type, Accept, Origin, User-Agent, Client-Name, User-Id, Session-Id, X-Requested-With, Access-Control-Request-Method, Access-Control-Request-Headers',
+                'Access-Control-Max-Age': '86400'
+            }
+            : {}),
         'Nodelink-Api-Version': '4',
         IamNodelink: 'true'
     };
@@ -439,7 +449,6 @@ function sendResponse(req, res, data, status, trace = false) {
         res.end();
         return;
     }
-    const nodelink = runtime.nodelink;
     let finalData = nodelink ? modifyPayload(nodelink, data) : data;
     if (finalData &&
         typeof finalData === 'object' &&
@@ -1139,7 +1148,19 @@ async function _internalHttp1Request(urlString, options = {}) {
         localAddress: actualLocalAddress
     };
     return new Promise((resolve, reject) => {
-        const req = lib.request(reqOptions, (res) => {
+        let req;
+        const reqErrorHandler = (err) => {
+            cleanupReq();
+            reject(err);
+        };
+        const reqTimeoutHandler = () => {
+            req.destroy(new Error(`Request timed out after ${timeout}ms for ${urlString}`));
+        };
+        const cleanupReq = () => {
+            req.removeListener('error', reqErrorHandler);
+            req.removeListener('timeout', reqTimeoutHandler);
+        };
+        req = lib.request(reqOptions, (res) => {
             const { statusCode, headers: respHeaders } = res;
             const responseStatus = statusCode ?? 0;
             const locationHeader = respHeaders.location;
@@ -1179,6 +1200,30 @@ async function _internalHttp1Request(urlString, options = {}) {
                     headers: nextHeaders
                 };
                 resolve(http1makeRequest(nextUrl, nextOptions));
+                return;
+            }
+            const isNoBodyResponse = method === 'HEAD' ||
+                responseStatus === 204 ||
+                responseStatus === 304 ||
+                (responseStatus >= 100 && responseStatus < 200);
+            if (isNoBodyResponse) {
+                if (streamOnly) {
+                    resolve({
+                        statusCode,
+                        headers: respHeaders,
+                        stream: res,
+                        finalUrl: urlString
+                    });
+                    return;
+                }
+                res.resume();
+                cleanupReq();
+                resolve({
+                    statusCode,
+                    headers: respHeaders,
+                    body: options.responseType === 'buffer' ? Buffer.alloc(0) : '',
+                    finalUrl: urlString
+                });
                 return;
             }
             let finalStream = res;
@@ -1277,17 +1322,6 @@ async function _internalHttp1Request(urlString, options = {}) {
             finalStream.on('data', onData);
             finalStream.once('end', onEnd);
         });
-        const reqErrorHandler = (err) => {
-            cleanupReq();
-            reject(err);
-        };
-        const reqTimeoutHandler = () => {
-            req.destroy(new Error(`Request timed out after ${timeout}ms for ${urlString}`));
-        };
-        const cleanupReq = () => {
-            req.removeListener('error', reqErrorHandler);
-            req.removeListener('timeout', reqTimeoutHandler);
-        };
         req.on('error', reqErrorHandler);
         req.on('timeout', reqTimeoutHandler);
         if (payloadBuffer) {
@@ -1411,6 +1445,52 @@ async function makeRequest(urlString, options, nodelink) {
         return http1makeRequest(urlString, options);
     }
     const localAddress = finalNodeLink?.routePlanner?.getIP?.() ?? undefined;
+    if (typeof Bun !== 'undefined' &&
+        !streamOnly &&
+        !body &&
+        !localAddress &&
+        !options.network?.proxy &&
+        (method === 'GET' || method === 'HEAD')) {
+        let t = null;
+        try {
+            const ac = new AbortController();
+            t = timeout ? setTimeout(() => ac.abort(), timeout) : null;
+            const res = await fetch(urlString, {
+                method,
+                headers: customHeaders,
+                signal: ac.signal
+            });
+            if (t) {
+                clearTimeout(t);
+                t = null;
+            }
+            if (method === 'HEAD' || res.status === 204 || res.status === 304) {
+                return {
+                    statusCode: res.status,
+                    headers: Object.fromEntries(res.headers),
+                    body: ''
+                };
+            }
+            const buf = await res.arrayBuffer();
+            if (buf.byteLength > maxResponseBodyBytes)
+                throw new Error('body too large');
+            const text = Buffer.from(buf).toString();
+            const ct = res.headers.get('content-type') ?? '';
+            const out = ct.includes('application/json') && text ? JSON.parse(text) : text;
+            return {
+                statusCode: res.status,
+                headers: Object.fromEntries(res.headers),
+                body: out
+            };
+        }
+        catch (e) {
+            if (t)
+                clearTimeout(t);
+            const msg = e.message;
+            if (msg === 'body too large' || e instanceof SyntaxError)
+                throw e;
+        }
+    }
     try {
         const url = new URL(urlString);
         if (http2FailedHosts.has(url.host)) {
@@ -1536,6 +1616,24 @@ async function makeRequest(urlString, options, nodelink) {
                             : undefined
                     }, finalNodeLink));
                 }
+                const isNoBodyResponse = method === 'HEAD' ||
+                    statusCode === 204 ||
+                    statusCode === 304 ||
+                    (statusCode !== undefined && statusCode >= 100 && statusCode < 200);
+                if (isNoBodyResponse) {
+                    if (streamOnly) {
+                        req.on('end', closeSessionGracefully);
+                        req.on('error', closeSessionGracefully);
+                        req.on('close', closeSessionGracefully);
+                        return resolve({ statusCode, headers, stream: req });
+                    }
+                    closeSessionGracefully();
+                    return resolve({
+                        statusCode,
+                        headers,
+                        body: options.responseType === 'buffer' ? Buffer.alloc(0) : ''
+                    });
+                }
                 let responseStream = req;
                 const encodingHeader = headers['content-encoding'];
                 const encoding = Array.isArray(encodingHeader)
@@ -1549,10 +1647,6 @@ async function makeRequest(urlString, options, nodelink) {
                     responseStream = req.pipe(zlib.createGunzip());
                 else if (encoding === 'deflate')
                     responseStream = req.pipe(zlib.createInflate());
-                if (method === 'HEAD') {
-                    closeSessionGracefully();
-                    return resolve({ statusCode, headers });
-                }
                 if (streamOnly) {
                     responseStream.on('end', closeSessionGracefully);
                     responseStream.on('error', closeSessionGracefully);
@@ -1774,7 +1868,18 @@ async function checkDependencyUpdates(credentialManager) {
             const isBun = process.versions.bun &&
                 fs.existsSync(path.resolve(process.cwd(), 'bun.lock'));
             const isPnpm = fs.existsSync(path.resolve(process.cwd(), 'pnpm-lock.yaml')) && !isBun;
-            const pkgTargets = updates.map((u) => `"${u.name}@^${u.latest}"`).join(' ');
+            const deps = packageJson
+                .dependencies || {};
+            const pkgTargets = updates
+                .map((u) => {
+                if (u.source === 'GitHub') {
+                    const spec = deps[u.name];
+                    if (spec)
+                        return `"${u.name}@${spec}"`;
+                }
+                return `"${u.name}@^${u.latest}"`;
+            })
+                .join(' ');
             const cmd = isPnpm
                 ? `pnpm add ${pkgTargets}`
                 : isBun

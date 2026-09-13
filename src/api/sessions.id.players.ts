@@ -434,7 +434,7 @@ interface PlayersRoutePlayerManager {
   seek: (
     guildId: string,
     position?: number,
-    endTime?: number
+    endTime?: number | null
   ) => Promise<boolean | object>
 
   /**
@@ -513,9 +513,10 @@ interface PlayersRoutePlayerManager {
    * Serializes player state.
    *
    * @param guildId - Target guild identifier.
+   * @param repairMissing - Whether a missing cluster player should be repaired.
    * @returns Promise resolving to the player JSON payload.
    */
-  toJSON: (guildId: string) => Promise<PlayerStateJSON>
+  toJSON: (guildId: string, repairMissing?: boolean) => Promise<PlayerStateJSON>
 }
 
 /**
@@ -1278,18 +1279,6 @@ async function applyPlayerPatch(
   const shouldClearNextTrack =
     payload.nextTrack === null || payload.nextTrack?.encoded === null
 
-  if (shouldClearNextTrack) {
-    await session.players.clearNextTrack(guildId)
-  } else if (payload.nextTrack) {
-    const trackToPreload = await resolvePreloadPayload(
-      runtime,
-      payload.nextTrack
-    )
-    if (trackToPreload) {
-      await session.players.preload(guildId, trackToPreload)
-    }
-  }
-
   if (stopPlayer) {
     await session.players.stop(guildId)
   }
@@ -1302,6 +1291,18 @@ async function applyPlayerPatch(
       startTime: payload.position,
       endTime: payload.endTime ?? undefined
     })
+  }
+
+  if (shouldClearNextTrack) {
+    await session.players.clearNextTrack(guildId)
+  } else if (payload.nextTrack) {
+    const trackToPreload = await resolvePreloadPayload(
+      runtime,
+      payload.nextTrack
+    )
+    if (trackToPreload) {
+      await session.players.preload(guildId, trackToPreload)
+    }
   }
 
   if (payload.volume !== undefined) {
@@ -1317,11 +1318,11 @@ async function applyPlayerPatch(
   }
 
   if (payload.endTime !== undefined) {
-    const playerState = await session.players.toJSON(guildId)
+    const playerState = await session.players.toJSON(guildId, true)
     await session.players.seek(
       guildId,
       playerState.state.position,
-      payload.endTime ?? undefined
+      payload.endTime
     )
   }
 
@@ -1354,7 +1355,7 @@ async function applyPlayerPatch(
     await session.players.setDucking(guildId, payload.ducking)
   }
 
-  return await session.players.toJSON(guildId)
+  return await session.players.toJSON(guildId, true)
 }
 
 /**

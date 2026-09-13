@@ -114,6 +114,20 @@ export function createBunServer(context, getRequestHandler) {
             return new Response('Internal Server Error', { status: 500 });
         },
         async fetch(req, server) {
+            if (req.method === 'OPTIONS' && context.options.server.cors === true) {
+                return new Response(null, {
+                    status: 204,
+                    headers: {
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD',
+                        'Access-Control-Allow-Headers': req.headers.get('access-control-request-headers') ||
+                            'Authorization, Content-Type, Accept, Origin, User-Agent, Client-Name, User-Id, Session-Id, X-Requested-With, Access-Control-Request-Method, Access-Control-Request-Headers',
+                        'Access-Control-Max-Age': '86400',
+                        'Nodelink-Api-Version': '4',
+                        IamNodelink: 'true'
+                    }
+                });
+            }
             const url = new URL(req.url);
             const pathname = url.pathname.endsWith('/')
                 ? url.pathname.slice(0, -1)
@@ -266,71 +280,52 @@ export function createBunServer(context, getRequestHandler) {
                 });
             }
             return new Promise((resolve) => {
-                const dataListeners = [];
-                const endListeners = [];
-                const errorListeners = [];
-                let bodyTriggered = false;
-                const triggerBodyRead = () => {
-                    if (bodyTriggered)
+                const data = [];
+                const end = [];
+                const err = [];
+                let triggered = false;
+                const emitEnd = () => {
+                    for (const f of end)
+                        try {
+                            f();
+                        }
+                        catch { }
+                };
+                const trigger = () => {
+                    if (triggered)
                         return;
-                    bodyTriggered = true;
-                    const hasBody = req.headers.get('content-length') ||
-                        req.headers.get('transfer-encoding');
-                    if (!hasBody && (req.method === 'GET' || req.method === 'HEAD')) {
-                        queueMicrotask(() => {
-                            for (const cb of endListeners) {
-                                try {
-                                    cb();
-                                }
-                                catch (e) {
-                                    logger('debug', 'Server', `Bun reqShim end listener threw: ${e.message}`);
-                                }
-                            }
-                        });
+                    triggered = true;
+                    const len = Number(req.headers.get('content-length'));
+                    const hasBody = (Number.isFinite(len) && len > 0) ||
+                        !!req.headers.get('transfer-encoding');
+                    if (!hasBody || !req.body) {
+                        queueMicrotask(emitEnd);
                         return;
                     }
                     req
                         .arrayBuffer()
                         .then((buf) => {
-                        const chunk = Buffer.from(buf);
-                        if (chunk.length > 0) {
-                            for (const cb of dataListeners) {
+                        if (buf.byteLength) {
+                            const chunk = Buffer.from(buf);
+                            for (const f of data)
                                 try {
-                                    cb(chunk);
+                                    f(chunk);
                                 }
-                                catch (e) {
-                                    logger('debug', 'Server', `Bun reqShim data listener threw: ${e.message}`);
-                                }
-                            }
+                                catch { }
                         }
-                        for (const cb of endListeners) {
-                            try {
-                                cb();
-                            }
-                            catch (e) {
-                                logger('debug', 'Server', `Bun reqShim end listener threw: ${e.message}`);
-                            }
-                        }
+                        emitEnd();
                     })
-                        .catch((err) => {
-                        const error = err instanceof Error ? err : new Error(String(err));
-                        if (errorListeners.length > 0) {
-                            for (const cb of errorListeners) {
+                        .catch((e) => {
+                        const er = e instanceof Error ? e : new Error(String(e));
+                        if (err.length)
+                            for (const f of err)
                                 try {
-                                    cb(error);
+                                    f(er);
                                 }
                                 catch { }
-                            }
-                        }
-                        else {
-                            logger('debug', 'Server', `Bun request body read failed: ${error.message}`);
-                            for (const cb of endListeners) {
-                                try {
-                                    cb();
-                                }
-                                catch { }
-                            }
-                        }
+                        else
+                            logger('debug', 'Server', `Bun request body read failed: ${er.message}`);
+                        emitEnd();
                     });
                 };
                 const reqShim = {
@@ -338,18 +333,17 @@ export function createBunServer(context, getRequestHandler) {
                     url: url.pathname + url.search,
                     headers: Object.fromEntries(req.headers),
                     socket: { remoteAddress: server.requestIP(req)?.address },
-                    on: (event, cb) => {
-                        if (event === 'data') {
-                            dataListeners.push(cb);
-                            triggerBodyRead();
+                    on: (ev, cb) => {
+                        if (ev === 'data') {
+                            data.push(cb);
+                            trigger();
                         }
-                        else if (event === 'end') {
-                            endListeners.push(cb);
-                            triggerBodyRead();
+                        else if (ev === 'end') {
+                            end.push(cb);
+                            trigger();
                         }
-                        else if (event === 'error') {
-                            errorListeners.push(cb);
-                        }
+                        else if (ev === 'error')
+                            err.push(cb);
                     }
                 };
                 const resShim = {

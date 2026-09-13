@@ -123,6 +123,7 @@ However, some clients may not work properly, since NodeLink changes certain beha
 | [CogLink](https://github.com/PerformanC/Coglink)                    | C            | unknown       | No                 | v1 and v2              |                                                                                                                                                                                                                 |
 | [Lavalink-rs](https://gitlab.com/vicky5124/lavalink-rs)             | Rust, Python | unknown       | No                 | v1 and v2              |                                                                                                                                                                                                                 |
 | [nyxx_lavalink](https://github.com/nyxx-discord/nyxx_lavalink)      | Dart         | unknown       | No                 | v1                     |                                                                                                                                                                                                                 |
+| [Lavalink.lua](https://github.com/filispeen/lavalink.lua)           | Lua          | Yes           | Yes                | v1, v2, v3             | Mambo                                                                                                                                                                                                           |
 
 > [!IMPORTANT]
 > Lack of explicit NodeLink support *usually* means that the client implements the Lavalink API inconsistently, not following its defined formats and fields. Using such clients may lead to unexpected behavior.
@@ -241,11 +242,11 @@ The goal is to make audio accessible, transparent, and fun to build.
 
 ## Star History
 
-<a href="https://www.star-history.com/#PerformanC/NodeLink&type=date&legend=top-left">
+<a href="https://www.star-history.com/?type=date&legend=top-left&repos=PerformanC%2FNodeLink">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=PerformanC/NodeLink&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=PerformanC/NodeLink&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=PerformanC/NodeLink&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=PerformanC/NodeLink&type=date&theme=dark&legend=top-left&sealed_token=XCnlJLyDMBYhi2jvz_T_9ZG1JGfFOuLiQXVI2eYOAS-bnQo7aWEzdUoLIymUZfQ1aGvTWSpIdnARPvaUHJBHMC-7HJtJT5DbPVBJcGBl8p2lD3ckEEL84g" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=PerformanC/NodeLink&type=date&legend=top-left&sealed_token=XCnlJLyDMBYhi2jvz_T_9ZG1JGfFOuLiQXVI2eYOAS-bnQo7aWEzdUoLIymUZfQ1aGvTWSpIdnARPvaUHJBHMC-7HJtJT5DbPVBJcGBl8p2lD3ckEEL84g" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=PerformanC/NodeLink&type=date&legend=top-left&sealed_token=XCnlJLyDMBYhi2jvz_T_9ZG1JGfFOuLiQXVI2eYOAS-bnQo7aWEzdUoLIymUZfQ1aGvTWSpIdnARPvaUHJBHMC-7HJtJT5DbPVBJcGBl8p2lD3ckEEL84g" />
  </picture>
 </a>
 

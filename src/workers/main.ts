@@ -64,6 +64,7 @@ import {
   enqueueHeadQueue,
   getHeadQueueLength
 } from './headQueue.ts'
+import { createStreamFinalizer } from './streamFinalizer.ts'
 
 type WorkerPlayerClass = typeof import('../playback/player.ts').Player
 type CreatePCMStreamFn =
@@ -1075,32 +1076,28 @@ const ipcMessageTracker = {
   trackSent(type: string, payload: unknown): void {
     if (!this.enabled) return
     try {
-      const size = Buffer.byteLength(JSON.stringify(payload))
-      const entry = this.sent.get(type) || {
-        count: 0,
-        totalBytes: 0,
-        maxBytes: 0
-      }
-      entry.count++
-      entry.totalBytes += size
-      entry.maxBytes = Math.max(entry.maxBytes, size)
-      this.sent.set(type, entry)
+      const size = v8.serialize(payload).byteLength
+      const e = this.sent.get(type) ?? { count: 0, totalBytes: 0, maxBytes: 0 }
+      e.count++
+      e.totalBytes += size
+      e.maxBytes = Math.max(e.maxBytes, size)
+      this.sent.set(type, e)
     } catch {}
   },
 
   trackReceived(type: string, payload: unknown): void {
     if (!this.enabled) return
     try {
-      const size = Buffer.byteLength(JSON.stringify(payload))
-      const entry = this.received.get(type) || {
+      const size = v8.serialize(payload).byteLength
+      const e = this.received.get(type) ?? {
         count: 0,
         totalBytes: 0,
         maxBytes: 0
       }
-      entry.count++
-      entry.totalBytes += size
-      entry.maxBytes = Math.max(entry.maxBytes, size)
-      this.received.set(type, entry)
+      e.count++
+      e.totalBytes += size
+      e.maxBytes = Math.max(e.maxBytes, size)
+      this.received.set(type, e)
     } catch {}
   },
 
@@ -1890,7 +1887,9 @@ function cleanupActiveStream(
   entry?: ActiveStreamEntry
 ): void {
   const current = entry || activeStreams.get(streamId)
-  if (!current) return
+  if (!current || current.cleaned) return
+
+  current.cleaned = true
 
   if (current.pcmStream && !current.pcmStream.destroyed) {
     current.pcmStream.destroy()
@@ -1953,27 +1952,31 @@ async function startLoadStream(
     payload?.filters || {}
   ) as unknown as PCMStream
 
-  const entry: ActiveStreamEntry = { pcmStream, fetched, cancelled: false }
+  const entry: ActiveStreamEntry = {
+    pcmStream,
+    fetched,
+    cancelled: false,
+    cleaned: false
+  }
   activeStreams.set(streamId, entry)
   streamLifecycle.created++
 
-  const finish = (err?: unknown) => {
-    if (entry.cancelled) {
+  const finish = createStreamFinalizer(entry, {
+    onCancelled: () => {
       streamLifecycle.cancelled++
-      cleanupActiveStream(streamId, entry)
-      return
-    }
-
-    if (err) {
+    },
+    onError: (error) => {
       streamLifecycle.errored++
-      sendStreamError(streamId, getErrorMessage(err))
-    } else {
+      sendStreamError(streamId, getErrorMessage(error))
+    },
+    onEnd: () => {
       streamLifecycle.ended++
       sendStreamEnd(streamId)
+    },
+    onCleanup: () => {
+      cleanupActiveStream(streamId, entry)
     }
-
-    cleanupActiveStream(streamId, entry)
-  }
+  })
 
   pcmStream.on('data', (chunk) => {
     if (!entry.cancelled) sendStreamChunk(streamId, chunk)
@@ -1988,6 +1991,7 @@ function cancelStream(streamId: string): boolean {
   const entry = activeStreams.get(streamId)
   if (!entry) return false
   entry.cancelled = true
+  streamLifecycle.cancelled++
   cleanupActiveStream(streamId, entry)
   return true
 }

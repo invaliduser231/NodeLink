@@ -458,11 +458,10 @@ async function _openRangeStream(
   const res = await fetch(url, {
     headers: { Range: `bytes=${start}-` }
   })
-  if (!res.ok) {
+  if (!res.ok || !res.body) {
     throw new Error(`HTTP ${res.status} while opening range stream`)
   }
-  // @ts-expect-error - Node.js Readable.fromWeb accepts ReadableStream
-  return Readable.fromWeb(res.body)
+  return Readable.fromWeb(res.body as never)
 }
 
 type MP4BoxSeekResult = number | { offset?: number; time?: number }
@@ -479,84 +478,90 @@ async function _buildMp4SeekOptions(
   proxy?: HttpProxyConfig
 ): Promise<MP4ToAACStreamOptions> {
   const mp4Box = await getMP4Box()
-  const mp4 = mp4Box.createFile() as unknown as MP4BoxFile
+  const mp4 = mp4Box.createFile(false) as unknown as MP4BoxFile
 
   const prefetch: MP4PrefetchChunk[] = []
   let readyInfo: MP4BoxInfo | null = null
   let nextStart = 0
 
-  await new Promise<void>(async (resolve, reject) => {
-    mp4.onError = (e: string) => reject(new Error(`MP4Box init error: ${e}`))
-    mp4.onReady = (info: MP4BoxInfo) => {
-      readyInfo = info
-      resolve()
-    }
-
-    const CHUNK = 512 * 1024
-    const MAX_FETCHES = 40
-
-    try {
-      for (let i = 0; i < MAX_FETCHES && !readyInfo; i++) {
-        const buf = await _fetchRange(
-          url,
-          nextStart,
-          nextStart + CHUNK - 1,
-          proxy
-        )
-        const ab = _toArrayBufferWithFileStart(buf, nextStart)
-
-        prefetch.push({ fileStart: nextStart, data: ab })
-        const appended = mp4.appendBuffer(ab)
-
-        if (typeof appended === 'number') {
-          nextStart = appended
-        } else {
-          nextStart += ab.byteLength
-        }
-
-        if (!Number.isFinite(nextStart) || nextStart < 0) break
-      }
-      if (!readyInfo) {
-        reject(
-          new Error('Could not parse MP4 metadata (moov not found quickly).')
-        )
-      }
-    } catch (e) {
-      reject(e)
-    }
-  })
-
-  const info = readyInfo as MP4BoxInfo | null
-  const audioTrack = info?.tracks.find((t: MP4BoxTrack) =>
-    t.codec?.startsWith('mp4a')
-  )
-  if (!audioTrack) {
-    throw new Error('No AAC track found in MP4/M4A')
-  }
-
-  mp4.setExtractionOptions(audioTrack.id, null, { nbSamples: 1 })
-
-  const seekTimeSec = seekTimeMs / 1000
-  const mp4boxFile = mp4 as unknown as {
-    seek: (time: number, async: boolean) => MP4BoxSeekResult
-  }
-  const seekRes = mp4boxFile.seek(seekTimeSec, true) as MP4BoxSeekResult
-  const startOffset = _seekOffset(seekRes)
-
   try {
-    mp4.stop()
-  } catch {}
+    await new Promise<void>(async (resolve, reject) => {
+      mp4.onError = (e: string) => reject(new Error(`MP4Box init error: ${e}`))
+      mp4.onReady = (info: MP4BoxInfo) => {
+        readyInfo = info
+        resolve()
+      }
 
-  if (!Number.isFinite(startOffset) || startOffset < 0) {
-    throw new Error(
-      `MP4Box seek returned invalid offset: ${JSON.stringify(seekRes)}`
+      const CHUNK = 512 * 1024
+      const MAX_FETCHES = 40
+
+      try {
+        for (let i = 0; i < MAX_FETCHES && !readyInfo; i++) {
+          const buf = await _fetchRange(
+            url,
+            nextStart,
+            nextStart + CHUNK - 1,
+            proxy
+          )
+          const ab = _toArrayBufferWithFileStart(buf, nextStart)
+
+          prefetch.push({ fileStart: nextStart, data: ab })
+          const appended = mp4.appendBuffer(ab)
+
+          if (typeof appended === 'number') {
+            nextStart = appended
+          } else {
+            nextStart += ab.byteLength
+          }
+
+          if (!Number.isFinite(nextStart) || nextStart < 0) break
+        }
+        if (!readyInfo) {
+          reject(
+            new Error('Could not parse MP4 metadata (moov not found quickly).')
+          )
+        }
+      } catch (e) {
+        reject(e)
+      }
+    })
+
+    const info = readyInfo as MP4BoxInfo | null
+    const audioTrack = info?.tracks.find((t: MP4BoxTrack) =>
+      t.codec?.startsWith('mp4a')
     )
-  }
+    if (!audioTrack) {
+      throw new Error('No AAC track found in MP4/M4A')
+    }
 
-  return {
-    prefetch,
-    baseFileStart: startOffset,
-    seekTimeSec
+    mp4.setExtractionOptions(audioTrack.id, null, { nbSamples: 1 })
+
+    const seekTimeSec = seekTimeMs / 1000
+    const mp4boxFile = mp4 as unknown as {
+      seek: (time: number, async: boolean) => MP4BoxSeekResult
+    }
+    const seekRes = mp4boxFile.seek(seekTimeSec, true) as MP4BoxSeekResult
+    const startOffset = _seekOffset(seekRes)
+
+    if (!Number.isFinite(startOffset) || startOffset < 0) {
+      throw new Error(
+        `MP4Box seek returned invalid offset: ${JSON.stringify(seekRes)}`
+      )
+    }
+
+    return {
+      prefetch,
+      baseFileStart: startOffset,
+      seekTimeSec
+    }
+  } finally {
+    try {
+      mp4.stop()
+      mp4.flush()
+    } catch {}
+    mp4.onReady = null
+    mp4.onSamples = null
+    mp4.onError = null
   }
 }
 
@@ -634,6 +639,34 @@ class PCMFrameCounter extends Transform {
   getConsumedMs(): number {
     return (this.totalFrames / this.sampleRate) * 1000
   }
+}
+
+/**
+ * Emits 'error' on a pipeline stream only when it can be received.
+ * Emitting with zero 'error' listeners throws, which escapes as an uncaught
+ * exception and kills the worker, so teardown races must never emit blindly.
+ */
+const emitResourceError = (
+  target:
+    | {
+        destroyed?: boolean
+        listenerCount?: (event: string) => number
+        emit?: (event: string, error: unknown) => boolean
+      }
+    | null
+    | undefined,
+  error: unknown
+): void => {
+  if (!target || !error) return
+  try {
+    if (target.destroyed) return
+    if (
+      typeof target.listenerCount === 'function' &&
+      target.listenerCount('error') === 0
+    )
+      return
+    target.emit?.('error', error)
+  } catch {}
 }
 
 class BaseAudioResource {
@@ -771,12 +804,18 @@ class BaseAudioResource {
 
     for (let i = this.pipes.length - 1; i >= 0; i--) {
       const pipe = this.pipes[i] as Transform & {
+        resume?: () => void
         abort?: () => void
         unpipe?: () => void
+        cleanup?: () => void
+        removeAllListeners?: () => void
         destroy?: () => void
       }
+      pipe.resume?.()
       pipe.abort?.()
       pipe.unpipe?.()
+      pipe.cleanup?.()
+      pipe.removeAllListeners?.()
       pipe.destroy?.()
     }
 
@@ -1119,6 +1158,10 @@ class SymphoniaDecoderStream extends Transform {
   abort(): void {
     this._aborted = true
     this._cancelTimers()
+  }
+
+  cleanup(): void {
+    this._cleanup()
   }
 
   _cancelTimers(): void {
@@ -1624,17 +1667,30 @@ class AACDecoderStream extends Transform {
       .catch((err: Error) => this.emit('error', err))
   }
 
+  cleanup(): void {
+    this.ringBuffer.dispose()
+    this.pendingChunks.length = 0
+    if (this.decoder) {
+      try {
+        this.decoder.free?.()
+        this.decoder.destroy?.()
+      } catch {}
+      this.decoder = null as unknown as FAAD2DecoderLike
+    }
+    if (this.resampler) {
+      try {
+        this.resampler.destroy?.()
+      } catch {}
+      this.resampler = null
+    }
+    this.resamplerCreationPromise = null
+  }
+
   override _destroy(
     err: Error | null,
     cb: (error?: Error | null) => void
   ): void {
-    this.ringBuffer.dispose()
-    this.pendingChunks.length = 0
-    if (this.decoder) this.decoder.free?.()
-    if (this.resampler) {
-      this.resampler.destroy?.()
-      this.resampler = null
-    }
+    this.cleanup()
     super._destroy(err, cb)
   }
 
@@ -1790,10 +1846,6 @@ class AACDecoderStream extends Transform {
         const frameInfo = this._findADTSFrame()
         if (!frameInfo) break
 
-        if (frameInfo.start > 0) {
-          this.ringBuffer.skip(frameInfo.start)
-        }
-
         const adtsFrame = frameInfo.frame
 
         if (!this.isConfigured) {
@@ -1832,13 +1884,24 @@ class AACDecoderStream extends Transform {
                       })
                     )
                     .then((resampler: ResamplerLike) => {
+                      if (this.destroyed || this.closed) {
+                        try {
+                          resampler.destroy?.()
+                        } catch {}
+                        return null as unknown as ResamplerLike
+                      }
                       this.resampler = resampler
                       this.resamplerCreationPromise = null
                       return resampler
                     })
+                    .catch((err) => {
+                      this.resamplerCreationPromise = null
+                      throw err
+                    })
                 }
 
                 const resampler = await this.resamplerCreationPromise
+                if (!resampler || this.destroyed || this.closed) return
                 const resampled = resampler.full(pcm)
                 const pcmInt16 = new Int16Array(resampled.length)
                 for (let i = 0; i < resampled.length; i++) {
@@ -1889,11 +1952,7 @@ class AACDecoderStream extends Transform {
       } catch (_err) {}
     }
 
-    if (this.resampler) {
-      this.resampler.destroy?.()
-      this.resampler = null
-    }
-    if (this.decoder) this.decoder.destroy?.()
+    this.cleanup()
     callback()
   }
 }
@@ -2023,7 +2082,7 @@ class MP4ToAACStream extends Transform {
 
     this._initPromise = (async () => {
       const mp4Box = await getMP4Box()
-      this.mp4boxFile = mp4Box.createFile(false) as unknown as MP4BoxFile
+      this.mp4boxFile = mp4Box.createFile(true) as unknown as MP4BoxFile
       this._setupMP4BoxHandlers()
     })()
 
@@ -2958,7 +3017,7 @@ class StreamAudioResource extends BaseAudioResource {
 
     pipeline(stream, demuxer, decoder, (err: Error | null): void => {
       if (err && !this._destroyed) {
-        this.stream?.emit('error', err)
+        emitResourceError(this.stream, err)
       }
     })
 
@@ -2995,7 +3054,7 @@ class StreamAudioResource extends BaseAudioResource {
           streams as unknown as Readable[],
           (err: Error | null): void => {
             if (err && !this._destroyed) {
-              this.stream?.emit('error', err)
+              emitResourceError(this.stream, err)
             }
           }
         )
@@ -3029,7 +3088,7 @@ class StreamAudioResource extends BaseAudioResource {
 
     pipeline(streams as unknown as Readable[], (err: Error | null): void => {
       if (err && !this._destroyed) {
-        this.stream?.emit('error', err)
+        emitResourceError(this.stream, err)
       }
     })
 
@@ -3044,7 +3103,7 @@ class StreamAudioResource extends BaseAudioResource {
 
     pipeline(stream, decoder, (err: Error | null): void => {
       if (err && !this._destroyed) {
-        this.stream?.emit('error', err)
+        emitResourceError(this.stream, err)
       }
     })
 
@@ -3052,6 +3111,12 @@ class StreamAudioResource extends BaseAudioResource {
   }
 
   _createOpusPipeline(stream: Readable, type: string): Transform {
+    if (!_isWebmFormat(type.toLowerCase())) {
+      // Ogg Opus decodes natively in Symphonia (libopus adapter)
+      // symphonia-adapter-libopus, only has the decoder.
+      return this._createSymphoniaPipeline(stream, type)
+    }
+
     const decoder = new OpusDecoder({
       rate: AUDIO_CONFIG.sampleRate,
       channels: AUDIO_CONFIG.channels
@@ -3059,18 +3124,16 @@ class StreamAudioResource extends BaseAudioResource {
 
     const streams: (Readable | Transform)[] = [stream]
 
-    if (_isWebmFormat(type.toLowerCase())) {
-      const demuxer = new WebmOpusDemuxer()
-      streams.push(demuxer)
-      this.pipes?.push(demuxer)
-    }
+    const demuxer = new WebmOpusDemuxer()
+    streams.push(demuxer)
+    this.pipes?.push(demuxer)
 
     streams.push(decoder)
     this.pipes?.push(decoder)
 
     pipeline(streams as unknown as Readable[], (err: Error | null): void => {
       if (err && !this._destroyed) {
-        this.stream?.emit('error', err)
+        emitResourceError(this.stream, err)
       }
     })
 
@@ -3178,7 +3241,7 @@ class StreamAudioResource extends BaseAudioResource {
 
     pipeline(streams as unknown as Readable[], (err: Error | null): void => {
       if (err && !this._destroyed) {
-        opusEncoder.emit('error', err)
+        emitResourceError(opusEncoder, err)
       }
     })
 
@@ -3287,7 +3350,7 @@ class StreamAudioResource extends BaseAudioResource {
 
       pipeline(pcmStream, volumeTransformer, (err: Error | null): void => {
         if (err && !this._destroyed) {
-          volumeTransformer.emit('error', err)
+          emitResourceError(volumeTransformer, err)
         }
       })
 
@@ -3317,14 +3380,14 @@ class StreamAudioResource extends BaseAudioResource {
     wrappedSource?.on?.('finishBuffering', forwardFinishBuffering)
 
     inputStream.on('error', (err: Error) => {
-      this.stream?.emit('error', err)
+      emitResourceError(this.stream, err)
     })
 
     if (this.pipes) {
       for (const pipe of this.pipes) {
         if (pipe !== this.stream) {
           pipe.on?.('error', (err: Error) => {
-            this.stream?.emit('error', err)
+            emitResourceError(this.stream, err)
           })
         }
       }
@@ -3434,7 +3497,7 @@ export const createSeekeableAudioResource = async (
         ranged,
         passthroughStream,
         (err: NodeJS.ErrnoException | null) => {
-          if (err) passthroughStream.emit('error', err)
+          if (err) emitResourceError(passthroughStream, err)
         }
       )
 
@@ -3471,7 +3534,7 @@ export const createSeekeableAudioResource = async (
     })
 
     pipeline(stream, passthroughStream, (err: NodeJS.ErrnoException | null) => {
-      if (err) passthroughStream.emit('error', err)
+      if (err) emitResourceError(passthroughStream, err)
     })
 
     const format = meta.codec?.container || player.streamInfo?.format
@@ -3565,13 +3628,19 @@ export const createPCMStream = (
     case SupportedFormats.OPUS: {
       if (_isWebmFormat(type.toLowerCase())) {
         streams.push(new WebmOpusDemuxer())
+        streams.push(
+          new OpusDecoder({
+            rate: AUDIO_CONFIG.sampleRate,
+            channels: AUDIO_CONFIG.channels
+          })
+        )
+      } else {
+        streams.push(
+          new SymphoniaDecoderStream({
+            codecRegistryHint: _getSymphoniaCodecHint(type)
+          })
+        )
       }
-      streams.push(
-        new OpusDecoder({
-          rate: AUDIO_CONFIG.sampleRate,
-          channels: AUDIO_CONFIG.channels
-        })
-      )
       break
     }
 

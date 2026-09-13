@@ -151,6 +151,8 @@ export default class YouTubeSource {
     liveChat;
     /** Map of active download streams keyed by a unique symbol or string, used for cancellation. */
     activeStreams;
+    /** SABR streams tracked for guild-aware abort when a player is destroyed. */
+    activeSabrStreams = new Map();
     /** Set of fallback-mirror lookup keys currently in flight, used to prevent infinite recursion loops. */
     mirrorFallbackInFlight;
     /** Map of track identifiers to a set of client names that failed to provide a playable URL. */
@@ -275,7 +277,7 @@ export default class YouTubeSource {
         }
         logger('debug', 'YouTube', `Initialized clients: ${Object.keys(this.clients).join(', ')}`);
         await this._fetchVisitorData();
-        await this.cipherManager.getCachedPlayerScript();
+        await this._loadPlayerScriptWithRetry();
         if (this.visitorDataInterval)
             clearInterval(this.visitorDataInterval);
         this.visitorDataInterval = setInterval(() => this._fetchVisitorData(), VISITOR_DATA_INTERVAL);
@@ -288,6 +290,30 @@ export default class YouTubeSource {
         return true;
     }
     /**
+     * Loads the player script with retries, tolerating transient rate limits
+     * (HTTP 429) during startup bursts. Failure never blocks source
+     * initialization; the script is re-fetched lazily on the next cipher
+     * operation.
+     * @internal
+     */
+    async _loadPlayerScriptWithRetry() {
+        const maxAttempts = 3;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                await this.cipherManager.getCachedPlayerScript();
+                return;
+            }
+            catch (e) {
+                logger('warn', 'YouTube', `Player script load failed (attempt ${attempt}/${maxAttempts}): ${e.message}`);
+                if (attempt === maxAttempts) {
+                    logger('warn', 'YouTube', 'Continuing without a cached player script; it will be fetched lazily.');
+                    return;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+            }
+        }
+    }
+    /**
      * Tears down the YouTube source by aborting active streams, clearing
      * the visitor data interval, and cleaning up OAuth and cipher resources.
      */
@@ -297,6 +323,17 @@ export default class YouTubeSource {
             cancelSignal.aborted = true;
         }
         this.activeStreams.clear();
+        for (const [, entry] of this.activeSabrStreams.entries()) {
+            try {
+                entry.stream.destroy();
+            }
+            catch { }
+            try {
+                entry.sabr.destroy();
+            }
+            catch { }
+        }
+        this.activeSabrStreams.clear();
         if (this.visitorDataInterval) {
             clearInterval(this.visitorDataInterval);
             this.visitorDataInterval = null;
@@ -309,6 +346,31 @@ export default class YouTubeSource {
             this.oauth.cleanup?.();
         this.cipherManager?.cleanup?.();
         this.failingClientsByTrack.clear();
+    }
+    /**
+     * Aborts all SABR streams for a guild (called on player destroy to stop
+     * background analysis windows that would otherwise keep stalling on 403s).
+     * @internal
+     */
+    abortGuildStreams(guildId) {
+        for (const [key, entry] of this.activeSabrStreams.entries()) {
+            if (entry.guildId !== guildId)
+                continue;
+            try {
+                entry.stream.destroy();
+            }
+            catch { }
+            try {
+                entry.sabr.destroy();
+            }
+            catch { }
+            this.activeSabrStreams.delete(key);
+            const cancel = this.activeStreams.get(key);
+            if (cancel) {
+                cancel.aborted = true;
+                this.activeStreams.delete(key);
+            }
+        }
     }
     /**
      * Fetches visitor data and player script URL from YouTube embed pages.
@@ -331,27 +393,24 @@ export default class YouTubeSource {
         let visitorFound = false;
         let playerScriptUrl = null;
         try {
-            const { body, error, statusCode } = await makeRequest('https://youtubei.googleapis.com/youtubei/v1/visitor_id?key=AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w', {
-                method: 'POST',
-                body: {
-                    context: {
-                        client: {
-                            clientName: 'ANDROID',
-                            clientVersion: '20.01.35'
-                        }
-                    }
-                },
+            const { body, error, statusCode } = await http1makeRequest('https://music.youtube.com/sw.js_data', {
+                method: 'GET',
+                responseType: 'buffer',
                 disableBodyCompression: true
             });
-            const data = body;
-            if (!error && statusCode === 200 && data?.responseContext?.visitorData) {
-                this.ytContext.client.visitorData = data.responseContext.visitorData;
-                visitorFound = true;
-                logger('debug', 'YouTube', `visitorData obtained from visitor_id endpoint (len=${data.responseContext.visitorData.length})`);
+            if (!error && statusCode === 200) {
+                const text = body.toString('utf-8');
+                const json = text.slice(text.indexOf('\n') + 1);
+                const visitorData = this._extractVisitorData(JSON.parse(json));
+                if (visitorData) {
+                    this.ytContext.client.visitorData = visitorData;
+                    visitorFound = true;
+                    logger('debug', 'YouTube', `visitorData obtained from sw.js_data endpoint (len=${visitorData.length})`);
+                }
             }
         }
         catch (e) {
-            logger('debug', 'YouTube', `visitor_id endpoint failed: ${e.message}`);
+            logger('debug', 'YouTube', `sw.js_data endpoint failed: ${e.message}`);
         }
         if (!visitorFound) {
             try {
@@ -407,6 +466,27 @@ export default class YouTubeSource {
         }
         if (playerScriptUrl)
             this.cipherManager.setPlayerScriptUrl(playerScriptUrl);
+    }
+    /**
+     * Recursively searches the parsed `sw.js_data` payload for the visitor data
+     * token. The token is a protobuf-encoded base64 string embedded somewhere in
+     * the nested response arrays, so its exact position cannot be relied upon.
+     * @param node - Current payload node (array or string) being inspected.
+     * @returns The visitor data token, or `null` when not found.
+     * @internal
+     */
+    _extractVisitorData(node) {
+        if (typeof node === 'string') {
+            return /^Cg[A-Za-z0-9+/=_%-]{100,}$/.test(node) ? node : null;
+        }
+        if (Array.isArray(node)) {
+            for (const child of node) {
+                const found = this._extractVisitorData(child);
+                if (found)
+                    return found;
+            }
+        }
+        return null;
     }
     /**
      * Searches YouTube for tracks, playlists, or recommendations.
@@ -553,14 +633,16 @@ export default class YouTubeSource {
         if (this.config.mirrorOfficialAlbums &&
             url.includes('list=OLAK') &&
             result.loadType === 'playlist') {
-            const tracks = result.data
-                ?.tracks;
+            const tracks = result.data?.tracks;
             if (tracks) {
                 for (const track of tracks) {
                     if (track.info && !track.info.uri.includes('olak=true')) {
                         const separator = track.info.uri.includes('?') ? '&' : '?';
                         track.info.uri += `${separator}olak=true`;
-                        track.encoded = encodeTrack({ ...track.info, details: [] });
+                        track.encoded = encodeTrack({
+                            ...track.info,
+                            details: []
+                        });
                     }
                 }
             }
@@ -810,7 +892,11 @@ export default class YouTubeSource {
                 }
             }
             const query = `${searchAuthor} ${searchTitle}`;
-            const searchTrack = { ...decodedTrack, title: searchTitle, author: searchAuthor };
+            const searchTrack = {
+                ...decodedTrack,
+                title: searchTitle,
+                author: searchAuthor
+            };
             try {
                 const res = await this.search(query, 'ytmsearch');
                 if (res.loadType === 'search' && res.data.length) {
@@ -894,6 +980,14 @@ export default class YouTubeSource {
                             ? 'webm/opus'
                             : 'm4a';
                     }
+                    if (urlData.additionalData) {
+                        ;
+                        urlData.additionalData.client =
+                            clientName;
+                    }
+                    else {
+                        urlData.additionalData = { client: clientName };
+                    }
                     return urlData;
                 }
                 if (urlData.url) {
@@ -926,7 +1020,8 @@ export default class YouTubeSource {
                                 contentLength,
                                 proxy: proxyToUse,
                                 itag: urlData.itag,
-                                formats: urlData.formats
+                                formats: urlData.formats,
+                                client: clientName
                             }
                         };
                         this.nodelink.trackCacheManager?.set('youtube', decodedTrack.identifier, result, 1000 * 60 * 60 * 5);
@@ -956,7 +1051,11 @@ export default class YouTubeSource {
                             const result = {
                                 url: urlData.hlsUrl,
                                 protocol: 'hls',
-                                format: 'mpegts'
+                                format: 'mpegts',
+                                additionalData: {
+                                    client: clientName,
+                                    proxy: proxyToUse
+                                }
                             };
                             this.nodelink.trackCacheManager?.set('youtube', decodedTrack.identifier, result, 1000 * 60 * 60 * 5);
                             return result;
@@ -983,7 +1082,11 @@ export default class YouTubeSource {
                         const result = {
                             url: urlData.hlsUrl,
                             protocol: 'hls',
-                            format: 'mpegts'
+                            format: 'mpegts',
+                            additionalData: {
+                                client: clientName,
+                                proxy: proxyToUse
+                            }
                         };
                         this.nodelink.trackCacheManager?.set('youtube', decodedTrack.identifier, result, 1000 * 60 * 60 * 5);
                         return result;
@@ -1247,6 +1350,12 @@ export default class YouTubeSource {
         };
         const sabr = new SabrStream(sabrConfig);
         const stream = new PassThrough();
+        const guildIdForStream = additionalData.guildId;
+        this.activeSabrStreams.set(streamKey, {
+            guildId: guildIdForStream,
+            sabr: sabr,
+            stream
+        });
         let readyResolved = false;
         let readyResolve;
         let readyReject;
@@ -1277,7 +1386,10 @@ export default class YouTubeSource {
         });
         sabr.on('finishBuffering', () => stream.emit('finishBuffering'));
         sabr.on('stall', async (reason = 'starvation', recoveryGeneration) => {
-            if (isRecovering || stream.destroyed || sabr.destroyed)
+            if (isRecovering ||
+                stream.destroyed ||
+                sabr.destroyed ||
+                _cancelSignal.aborted)
                 return;
             isRecovering = true;
             const generation = recoveryGeneration ?? sabr.getMediaProgressGeneration();
@@ -1339,9 +1451,11 @@ export default class YouTubeSource {
             if (isDestroying)
                 return stream;
             isDestroying = true;
+            _cancelSignal.aborted = true;
             stream.removeListener('drain', onSabrDrain);
             sabr.destroy(err);
             this.activeStreams.delete(streamKey);
+            this.activeSabrStreams.delete(streamKey);
             originalDestroy(err);
             return stream;
         });
@@ -1349,9 +1463,11 @@ export default class YouTubeSource {
             if (isDestroying)
                 return;
             isDestroying = true;
+            _cancelSignal.aborted = true;
             stream.removeListener('drain', onSabrDrain);
             sabr.destroy();
             this.activeStreams.delete(streamKey);
+            this.activeSabrStreams.delete(streamKey);
         });
         stream._sabrStream = sabr;
         stream.beginSeekHandoff = () => {
@@ -1846,6 +1962,9 @@ export default class YouTubeSource {
         let isBackpressured = false;
         let totalBytesReceived = 0;
         let currentItag = additionalData?.itag;
+        let currentClient = additionalData?.client || undefined;
+        let consecutiveClientFailures = 0;
+        let parkedForRecovery = false;
         let availableFormats = additionalData?.formats || [];
         const failedItags = new Set();
         let refreshAttempts = 0;
@@ -1914,6 +2033,7 @@ export default class YouTubeSource {
         stream.once('close', () => cleanup());
         stream.once('error', (err) => cleanup(err));
         stream.on('drain', onDrain);
+        let totalContentLength = contentLength;
         const refreshUrl = async (reason) => {
             if (isDestroyed || cancelSignal.aborted)
                 return null;
@@ -1924,7 +2044,8 @@ export default class YouTubeSource {
             logger('debug', 'YouTube', `Refreshing URL for "${decodedTrack.title}" (reason: ${reason}, ${refreshAttempts}/${MAX_URL_REFRESH})`);
             try {
                 let itagToTry = null;
-                if (currentItag &&
+                if (totalBytesReceived === 0 &&
+                    currentItag &&
                     failedItags.has(currentItag) &&
                     availableFormats.length > 0) {
                     const currentMime = availableFormats.find((f) => f.itag === currentItag)?.mimeType || '';
@@ -1942,22 +2063,54 @@ export default class YouTubeSource {
                         logger('info', 'YouTube', `Switching to itag ${itagToTry} for "${decodedTrack.title}"`);
                     }
                 }
-                const newUrlData = await this.getTrackUrl(decodedTrack, itagToTry, true);
+                else if (totalBytesReceived > 0 && currentItag) {
+                    itagToTry = currentItag;
+                }
+                if (consecutiveClientFailures >= 2 && currentClient) {
+                    if (!this.failingClientsByTrack.has(decodedTrack.identifier)) {
+                        this.failingClientsByTrack.set(decodedTrack.identifier, new Set());
+                    }
+                    this.failingClientsByTrack
+                        .get(decodedTrack.identifier)
+                        ?.add(currentClient);
+                    logger('warn', 'YouTube', `Client ${currentClient} failed repeatedly mid-stream for "${decodedTrack.title}". Rotating to next client in playback list...`);
+                    this.nodelink.trackCacheManager?.delete?.('youtube', decodedTrack.identifier);
+                    consecutiveClientFailures = 0;
+                }
+                let newUrlData = await this.getTrackUrl(decodedTrack, itagToTry, true);
+                if ((newUrlData.exception || !newUrlData.url) && itagToTry !== null) {
+                    newUrlData = await this.getTrackUrl(decodedTrack, null, true);
+                }
                 if (isDestroyed || cancelSignal.aborted)
                     return null;
                 if (newUrlData.exception || !newUrlData.url)
                     return null;
-                currentUrl = newUrlData.url;
                 const newAd = newUrlData.additionalData;
+                const newClient = newAd?.client || undefined;
+                if (newClient) {
+                    currentClient = newClient;
+                }
+                if (totalBytesReceived > 0 &&
+                    newUrlData.itag &&
+                    currentItag &&
+                    newUrlData.itag !== currentItag) {
+                    logger('warn', 'YouTube', `Client rotation changed format (${currentItag} -> ${newUrlData.itag}) at ${totalBytesReceived} bytes for "${decodedTrack.title}". Parking stream so the player can seek-recover at the exact position on the next client...`);
+                    parkedForRecovery = true;
+                    return null;
+                }
+                currentUrl = newUrlData.url;
                 currentProxy =
                     newAd?.proxy ||
                         currentProxy;
                 currentItag = newUrlData.itag || currentItag;
                 if (newUrlData.formats)
                     availableFormats = newUrlData.formats;
+                if (totalBytesReceived === 0 && newAd?.contentLength) {
+                    totalContentLength = newAd.contentLength;
+                }
                 urlFetchTime = Date.now();
                 consecutiveResets = 0;
-                logger('debug', 'YouTube', `URL refreshed for "${decodedTrack.title}" (itag ${currentItag})`);
+                logger('debug', 'YouTube', `URL refreshed for "${decodedTrack.title}" (itag ${currentItag}, client: ${currentClient || 'unknown'})`);
                 return currentUrl;
             }
             catch (err) {
@@ -1978,11 +2131,14 @@ export default class YouTubeSource {
             let chunkCount = 0;
             while (!isDestroyed &&
                 !cancelSignal.aborted &&
-                totalBytesReceived < contentLength) {
+                !parkedForRecovery &&
+                totalBytesReceived < totalContentLength) {
                 const urlAge = Date.now() - urlFetchTime;
                 if (urlAge > URL_MAX_AGE_MS) {
                     const refreshed = await refreshUrl('URL age > 4.5h');
                     if (!refreshed) {
+                        if (parkedForRecovery)
+                            return;
                         cleanup(new Error('Failed to refresh expired URL'));
                         return;
                     }
@@ -1993,7 +2149,7 @@ export default class YouTubeSource {
                 let dynamicChunkSize = Math.floor(bytesPerSecond * targetSeconds);
                 dynamicChunkSize = Math.max(ABS_MIN_BYTES, Math.min(dynamicChunkSize, ABS_MAX_BYTES));
                 const start = totalBytesReceived;
-                const end = Math.min(start + dynamicChunkSize - 1, contentLength - 1);
+                const end = Math.min(start + dynamicChunkSize - 1, totalContentLength - 1);
                 const rangeHeader = `bytes=${start}-${end}`;
                 try {
                     const result = await http1makeRequest(currentUrl, {
@@ -2025,13 +2181,37 @@ export default class YouTubeSource {
                     this.reportProxyStatus(proxyToUse, !result.error && result.statusCode === 206, result.statusCode || 0, Date.now() - fetchStartTime);
                     if (result.error ||
                         (result.statusCode !== 200 && result.statusCode !== 206)) {
-                        if (result.statusCode === 403 || result.statusCode === 404) {
-                            logger('warn', 'YouTube', `HTTP ${result.statusCode} for "${decodedTrack.title}" -- refreshing...`);
+                        if (result.statusCode === 416) {
+                            if (totalBytesReceived > 0) {
+                                logger('debug', 'YouTube', `HTTP 416 Range Not Satisfiable at ${totalBytesReceived}/${totalContentLength} bytes -- stream completed`);
+                                if (!stream.writableEnded) {
+                                    stream.emit('finishBuffering');
+                                    stream.end();
+                                }
+                                return;
+                            }
+                            logger('warn', 'YouTube', `HTTP 416 at byte 0 for "${decodedTrack.title}" -- refreshing...`);
                             if (currentItag)
                                 failedItags.add(currentItag);
+                            const refreshed = await refreshUrl('HTTP 416');
+                            if (refreshed)
+                                continue;
+                            if (parkedForRecovery)
+                                return;
+                            cleanup(new Error('HTTP 416: max URL refresh reached'));
+                            return;
+                        }
+                        if (result.statusCode === 403 || result.statusCode === 404) {
+                            consecutiveClientFailures++;
+                            logger('warn', 'YouTube', `HTTP ${result.statusCode} for "${decodedTrack.title}" (client: ${currentClient || 'unknown'}, failure #${consecutiveClientFailures}) -- refreshing...`);
+                            if (totalBytesReceived === 0 && currentItag) {
+                                failedItags.add(currentItag);
+                            }
                             const refreshed = await refreshUrl(`HTTP ${result.statusCode}`);
                             if (refreshed)
                                 continue;
+                            if (parkedForRecovery)
+                                return;
                             cleanup(new Error(`HTTP ${result.statusCode}: max URL refresh reached`));
                             return;
                         }
@@ -2061,6 +2241,8 @@ export default class YouTubeSource {
                         const refreshed = await refreshUrl('invalid range response');
                         if (refreshed)
                             continue;
+                        if (parkedForRecovery)
+                            return;
                         cleanup(new Error('Invalid HTTP range response'));
                         return;
                     }
@@ -2079,6 +2261,7 @@ export default class YouTubeSource {
                                 responseStream.destroy();
                                 return;
                             }
+                            consecutiveClientFailures = 0;
                             if (dataStartTime === 0)
                                 dataStartTime = Date.now();
                             bytesThisChunk += chunk.length;
@@ -2134,10 +2317,10 @@ export default class YouTubeSource {
                     logger(
                       'debug',
                       'YouTube',
-                      `Chunk #${chunkCount} complete: ${bytesThisChunk} bytes in ${Date.now() - fetchStartTime}ms (${totalBytesReceived}/${contentLength} total, target=${targetSeconds}s)`
+                      `Chunk #${chunkCount} complete: ${bytesThisChunk} bytes in ${Date.now() - fetchStartTime}ms (${totalBytesReceived}/${totalContentLength} total, target=${targetSeconds}s)`
                     ) */
                     // i was using this for debugging, so i will keep this commented incase i need it later.
-                    if (totalBytesReceived >= contentLength) {
+                    if (totalBytesReceived >= totalContentLength) {
                         if (!stream.writableEnded) {
                             stream.emit('finishBuffering');
                             stream.end();
@@ -2175,6 +2358,8 @@ export default class YouTubeSource {
                             const refreshed = await refreshUrl('multiple ECONNRESET on same URL');
                             if (refreshed)
                                 continue;
+                            if (parkedForRecovery)
+                                return;
                             cleanup(new Error('ECONNRESET: max URL refresh reached'));
                             return;
                         }
@@ -2184,11 +2369,15 @@ export default class YouTubeSource {
                     }
                     if (error.message?.includes('403') ||
                         error.message?.includes('404')) {
-                        if (currentItag)
+                        consecutiveClientFailures++;
+                        if (totalBytesReceived === 0 && currentItag) {
                             failedItags.add(currentItag);
+                        }
                         const refreshed = await refreshUrl('mid-stream 403/404');
                         if (refreshed)
                             continue;
+                        if (parkedForRecovery)
+                            return;
                         cleanup(new Error('mid-stream 403/404: max URL refresh reached'));
                         return;
                     }

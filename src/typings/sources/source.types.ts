@@ -726,6 +726,8 @@ export interface TrackCacheManager {
     source: string,
     identifier: string
   ) => TrackCacheEntry<unknown> | null
+  /** Delete a cached entry; returns whether it existed */
+  delete?: (source: string, identifier: string) => boolean
   /** Persist the cache to disk immediately */
   forceSave?: () => Promise<void>
 }
