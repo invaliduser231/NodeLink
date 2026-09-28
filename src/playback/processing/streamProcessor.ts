@@ -122,7 +122,8 @@ const AUDIO_CONSTANTS: AudioConstants = Object.freeze({
   pcmFloatFactor: 32767,
   maxDecodesPerTick: 5,
   decodeIntervalMs: 10,
-  inputResumeTimeoutMs: 5000
+  inputResumeTimeoutMs: 5000,
+  maxBufferedInputBytes: 512 * 1024
 })
 
 const MPEGTS_CONFIG: MpegtsConfig = Object.freeze({
@@ -1197,7 +1198,7 @@ class SymphoniaDecoderStream extends Transform {
       }
       this._scheduleDecode()
 
-      if (this.readableLength >= this.readableHighWaterMark) {
+      if (this._shouldHoldInput()) {
         this._holdInput(callback)
         return
       }
@@ -1211,11 +1212,38 @@ class SymphoniaDecoderStream extends Transform {
   _holdInput(callback: TransformCallback): void {
     this._releaseInput()
     this._pendingInputCallback = callback
+    this._armInputTimer()
+  }
+
+  _armInputTimer(): void {
     this._pendingInputTimer = setTimeout(() => {
       this._pendingInputTimer = null
+      if (this._isInputBacklogFull() && this._isDecoderValid()) {
+        this._armInputTimer()
+        return
+      }
       this._releaseInput()
     }, AUDIO_CONSTANTS.inputResumeTimeoutMs)
     this._pendingInputTimer.unref?.()
+  }
+
+  _isInputBacklogFull(): boolean {
+    if (!this.decoder?.isProbed) return false
+    return (
+      (this.decoder.bufferedBytes ?? 0) >= AUDIO_CONSTANTS.maxBufferedInputBytes
+    )
+  }
+
+  _shouldHoldInput(): boolean {
+    return (
+      this.readableLength >= this.readableHighWaterMark ||
+      this._isInputBacklogFull()
+    )
+  }
+
+  _maybeReleaseInput(): void {
+    if (!this._pendingInputCallback || this._shouldHoldInput()) return
+    this._releaseInput()
   }
 
   _releaseInput(): void {
@@ -1233,9 +1261,7 @@ class SymphoniaDecoderStream extends Transform {
   override _read(_size: number): void {
     super._read(_size)
 
-    if (this.readableLength < this.readableHighWaterMark) {
-      this._releaseInput()
-    }
+    this._maybeReleaseInput()
 
     if (this._isDecoderValid()) {
       this._scheduleDecode()
@@ -1349,6 +1375,7 @@ class SymphoniaDecoderStream extends Transform {
       this._failDecode(err)
     } finally {
       this._isDecoding = false
+      this._maybeReleaseInput()
     }
   }
 

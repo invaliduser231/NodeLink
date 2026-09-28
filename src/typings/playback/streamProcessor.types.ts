@@ -43,6 +43,7 @@ export interface AudioConstants {
   decodeIntervalMs: number
   /** Safety net before a held input callback is released anyway. */
   inputResumeTimeoutMs: number
+  maxBufferedInputBytes: number
 }
 
 /**
