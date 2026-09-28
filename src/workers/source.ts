@@ -47,6 +47,11 @@ import {
   enqueueHeadQueue,
   getHeadQueueLength
 } from './headQueue.ts'
+import {
+  isStreamControlMessage,
+  type StreamControlAction,
+  StreamControlRegistry
+} from '../managers/sourceStreamFlow.ts'
 
 const __filename = fileURLToPath(import.meta.url)
 
@@ -210,6 +215,8 @@ if (isMainThread) {
   const SCALE_UP_COOLDOWN_MS = specConfig.scaleCooldownMs ?? 1000
   const workerPool: MicroWorker[] = []
   const taskQueue = createHeadQueue<TaskData>()
+  const streamOwners: Map<string, MicroWorker> = new Map()
+  const queuedStreams: Map<string, StreamControlAction | null> = new Map()
   let lastScaleUpAt = 0
   let nextThreadId = initialThreadCount + 1
   const inheritedExecArgv = process.execArgv || []
@@ -253,10 +260,12 @@ if (isMainThread) {
       } else if (msg.type === 'chatAction') {
         sendChatAction(msg.socketPath, msg.id, msg.data)
       } else if (msg.type === 'end') {
+        streamOwners.delete(msg.id)
         sendStreamEnd(msg.socketPath, msg.id)
         worker.load = Math.max(0, worker.load - 1)
         processNextTask()
       } else if (msg.type === 'error') {
+        streamOwners.delete(msg.id)
         sendStreamError(msg.socketPath, msg.id, msg.error)
         worker.load = Math.max(0, worker.load - 1)
         processNextTask()
@@ -266,6 +275,9 @@ if (isMainThread) {
     worker.on('exit', (code) => {
       const idx = workerPool.indexOf(worker)
       if (idx !== -1) workerPool.splice(idx, 1)
+      for (const [streamId, owner] of streamOwners) {
+        if (owner === worker) streamOwners.delete(streamId)
+      }
 
       const loadInfo =
         worker.load > 0 ? ` (had ${worker.load} pending tasks)` : ''
@@ -563,12 +575,48 @@ if (isMainThread) {
     if (bestWorker) {
       const task = dequeueHeadQueue(taskQueue)
       if (task) {
-        bestWorker.load++
-        bestWorker.postMessage(task)
+        const pendingControl =
+          task.task === 'loadStream' ? queuedStreams.get(task.id) : null
+        if (task.task === 'loadStream') queuedStreams.delete(task.id)
+
+        if (pendingControl !== 'cancel') {
+          if (task.task === 'loadStream') streamOwners.set(task.id, bestWorker)
+          bestWorker.load++
+          bestWorker.postMessage(task)
+          if (pendingControl) {
+            postStreamControl(bestWorker, task.id, pendingControl)
+          }
+        }
 
         if (getHeadQueueLength(taskQueue) > 0) setImmediate(processNextTask)
       }
     }
+  }
+
+  function postStreamControl(
+    worker: MicroWorker,
+    id: string,
+    action: StreamControlAction
+  ): void {
+    worker.postMessage({
+      id,
+      task: 'streamControl',
+      payload: { action },
+      socketPath: ''
+    } satisfies TaskData)
+  }
+
+  function routeStreamControl(id: string, action: StreamControlAction): void {
+    const owner = streamOwners.get(id)
+    if (owner) {
+      if (action === 'cancel') streamOwners.delete(id)
+      postStreamControl(owner, id, action)
+      return
+    }
+
+    if (!queuedStreams.has(id)) return
+    if (queuedStreams.get(id) === 'cancel') return
+    queuedStreams.set(id, action)
   }
 
   /**
@@ -577,8 +625,16 @@ if (isMainThread) {
   process.on('message', (msg: { type: string; payload?: TaskData }) => {
     nodelink.pluginManager?.callHook('onIPCMessage', msg)
 
+    if (isStreamControlMessage(msg)) {
+      routeStreamControl(msg.payload.id, msg.payload.action)
+      return
+    }
+
     if (msg.type !== 'sourceTask') return
     if (msg.payload) {
+      if (msg.payload.task === 'loadStream') {
+        queuedStreams.set(msg.payload.id, null)
+      }
       enqueueHeadQueue(taskQueue, msg.payload)
       maybeScaleUpMicroWorkers()
       processNextTask()
@@ -737,6 +793,7 @@ if (isMainThread) {
    * @internal
    */
   const activeChats = new Map<string, boolean>()
+  const streamControls = new StreamControlRegistry()
   const profilerBaseDir = process.env.NODELINK_PROFILER_DIR || '.profiles'
   let activeCpuSession: {
     session: inspector.Session
@@ -1353,6 +1410,7 @@ if (isMainThread) {
     const finish = (err?: Error | string | null): void => {
       if (finished) return
       finished = true
+      streamControls.release(id)
       if (err) {
         const errMsg = typeof err === 'string' ? err : err.message
         sendStreamErrorFromWorker(id, socketPath, errMsg)
@@ -1361,6 +1419,8 @@ if (isMainThread) {
       }
       cleanup()
     }
+
+    streamControls.register(id, () => finish())
 
     try {
       const trackInfo = payload?.decodedTrackInfo
@@ -1447,6 +1507,12 @@ if (isMainThread) {
         ) as unknown as PCMStream
       }
 
+      if (finished) {
+        cleanup()
+        return
+      }
+      streamControls.attach(id, pcmStream)
+
       pcmStream.on('data', (chunk: Buffer) => {
         if (!finished) sendStreamChunkFromWorker(id, socketPath, chunk)
       })
@@ -1466,6 +1532,12 @@ if (isMainThread) {
     nodelink.pluginManager?.callHook('onIPCMessage', taskData)
 
     const { id, task, payload, socketPath } = taskData
+
+    if (task === 'streamControl') {
+      const action = (payload as { action?: StreamControlAction }).action
+      if (action) streamControls.apply(id, action)
+      return
+    }
 
     if (task === 'loadStream') {
       try {

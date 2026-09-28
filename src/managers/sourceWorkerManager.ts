@@ -7,6 +7,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { logger } from '../utils.ts'
+import {
+  type StreamControlAction,
+  type StreamControlMessage,
+  StreamFlowGate
+} from './sourceStreamFlow.ts'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -68,6 +73,7 @@ interface DelegatedResponse {
   end(chunk?: string | Buffer): void
   send?(chunk: Buffer): void
   on?(event: 'close', listener: () => void): void
+  once?(event: 'drain', listener: () => void): void
 }
 
 /**
@@ -98,6 +104,8 @@ interface SourceRequestEntry {
   workerId: number
   options: DelegateOptions
   cleaned: boolean
+  flow?: StreamFlowGate
+  settled?: boolean
 }
 
 type ExecuteAllResultEntry =
@@ -343,11 +351,13 @@ class SourceWorkerManager {
                 request.res.writeHead(request.options?.statusCode || 200)
               }
               try {
-                request.res.write(payload)
+                if (request.flow) request.flow.write(payload)
+                else request.res.write(payload)
               } catch {
                 this._cleanupRequest(id, request)
               }
             } else if (type === 1) {
+              request.settled = true
               try {
                 request.res.end()
               } catch {}
@@ -380,6 +390,7 @@ class SourceWorkerManager {
                 }
               }
             } else if (type === 2) {
+              request.settled = true
               const errorMsg = payload.toString('utf8')
               if (!request.res.headersSent) {
                 request.res.writeHead(500, {
@@ -590,10 +601,31 @@ class SourceWorkerManager {
     this.workers = []
   }
 
+  private _sendStreamControl(
+    workerId: number,
+    id: string,
+    action: StreamControlAction
+  ): void {
+    const worker = this.workers.find((w) => w.id === workerId)
+    if (!worker?.isConnected()) return
+
+    const message: StreamControlMessage = {
+      type: 'streamControl',
+      payload: { id, action }
+    }
+    try {
+      worker.send(message)
+    } catch {}
+  }
+
   private _cleanupRequest(id: string, request: SourceRequestEntry): void {
     if (!request || request.cleaned) return
     request.cleaned = true
     if (request.timeout) clearTimeout(request.timeout)
+
+    if (request.task === 'loadStream' && !request.settled) {
+      this._sendStreamControl(request.workerId, id, 'cancel')
+    }
 
     if (request.task === 'loadLiveChat') {
       const worker = this.workers.find((w) => w.id === request.workerId)
@@ -661,6 +693,13 @@ class SourceWorkerManager {
         this._cleanupRequest(id, activeRequest)
       }
     }, 60000)
+
+    if (task === 'loadStream') {
+      const workerId = bestWorker.id
+      request.flow = new StreamFlowGate(res, (action) =>
+        this._sendStreamControl(workerId, id, action)
+      )
+    }
 
     this.requests.set(id, request)
     this.workerLoads.set(bestWorker.id, minLoad + 1)
