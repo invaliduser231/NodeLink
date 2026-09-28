@@ -107,7 +107,7 @@ export function createBunServer(context, getRequestHandler) {
     const server = Bun.serve({
         port,
         hostname: host,
-        maxRequestBodySize: 1024 * 1024 * 50,
+        maxRequestBodySize: context.options.server?.maxBodySize ?? 1024 * 1024,
         idleTimeout: 60,
         error(error) {
             logger('error', 'Server', `HTTP server error: ${error instanceof Error ? error.message : String(error)}`);
@@ -184,11 +184,38 @@ export function createBunServer(context, getRequestHandler) {
             if (isMainWs || voiceMatch || liveMatch) {
                 const remoteAddress = server.requestIP(req)?.address || 'unknown';
                 const clientAddress = `[External] (${remoteAddress})`;
+                const isIpBlocked = context.admissionManager.isIpBlocked(remoteAddress);
+                if (isIpBlocked) {
+                    return new Response('Forbidden', {
+                        status: 403,
+                        statusText: 'Forbidden'
+                    });
+                }
+                const upgradeReqShim = {
+                    method: req.method,
+                    url: req.url,
+                    headers: Object.fromEntries(req.headers),
+                    socket: { remoteAddress }
+                };
+                const admissionContext = context.admissionManager.resolveContext(upgradeReqShim, url);
+                const admissionDecision = context.admissionManager.admit(admissionContext);
+                if (!admissionDecision.allowed) {
+                    return new Response('Too Many Requests', {
+                        status: admissionDecision.status,
+                        statusText: 'Too Many Requests',
+                        headers: {
+                            'Retry-After': String(admissionDecision.retryAfterSeconds),
+                            'Nodelink-Api-Version': '4',
+                            IamNodelink: 'true'
+                        }
+                    });
+                }
                 const clientName = req.headers.get('client-name');
                 const auth = req.headers.get('authorization');
                 const userId = req.headers.get('user-id');
                 let sessionId = req.headers.get('session-id');
                 if (auth !== password) {
+                    context.admissionManager.recordAuthFailure(remoteAddress);
                     logger('warn', 'Server', `Unauthorized connection attempt from ${clientAddress} - Invalid password provided: ${auth || 'None'}`);
                     return new Response('Invalid password provided.', {
                         status: 401,
@@ -253,7 +280,7 @@ export function createBunServer(context, getRequestHandler) {
                     eventName = '/v4/websocket/youtube/live';
                     routeId = liveMatch[1] ?? null;
                 }
-                if (sessionId && !context.sessions.resumableSessions.has(sessionId)) {
+                if (sessionId && !context.sessions.isResumable(sessionId)) {
                     logger('warn', 'Server', `Session-ID provided by ${clientAddress} does not exist or is not resumable: ${sessionId}, creating a new session`);
                     sessionId = null;
                 }
@@ -342,8 +369,9 @@ export function createBunServer(context, getRequestHandler) {
                             end.push(cb);
                             trigger();
                         }
-                        else if (ev === 'error')
+                        else if (ev === 'error') {
                             err.push(cb);
+                        }
                     }
                 };
                 const resShim = {
@@ -488,7 +516,7 @@ export async function cleanupBunServer(context, server) {
         // Without this, Bun.stop(true) tears TCP connections down without
         // sending close frames, surfacing as ECONNRESET on the client.
         let closedCount = 0;
-        for (const session of context.sessions.activeSessions.values()) {
+        for (const session of context.sessions.values()) {
             if (!session.socket)
                 continue;
             try {
@@ -505,8 +533,7 @@ export async function cleanupBunServer(context, server) {
                 }
             }
         }
-        context.sessions.activeSessions.clear();
-        context.sessions.resumableSessions.clear();
+        context.sessions.clearSessions();
         logger('info', 'WebSocket', `Signalled close to ${closedCount} WebSocket connection(s)`);
         // Prefer graceful stop so the close frames above flush. If clients
         // don't drain within 1.5s (slow networks, half-open peers), fall

@@ -1518,7 +1518,9 @@ if (isMainThread) {
               info: (payload as { decodedTrackInfo: TrackInfo })
                 .decodedTrackInfo
             },
-            (payload as { language?: string }).language
+            (payload as { language?: string }).language,
+            undefined,
+            (payload as { source?: string }).source
           )
           break
         }

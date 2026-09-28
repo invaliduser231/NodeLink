@@ -39,6 +39,11 @@ export interface ApiSocketInfo {
    * Client TCP port when available.
    */
   remotePort?: number
+
+  /**
+   * Aborts and closes the underlying TCP socket.
+   */
+  destroy?: () => void
 }
 
 /**
@@ -84,12 +89,14 @@ export interface ApiRequest {
   /**
    * Event listener registration (data/end).
    */
-  on?: (event: string, listener: (chunk: Buffer) => void) => void
+  // biome-ignore lint/suspicious/noExplicitAny: event emitter listener parameters vary by event
+  on?: (event: string, listener: (...args: any[]) => void) => void
 
   /**
    * Removes a registered event listener.
    */
-  removeListener?: (event: string, listener: (chunk: Buffer) => void) => void
+  // biome-ignore lint/suspicious/noExplicitAny: event emitter listener parameters vary by event
+  removeListener?: (event: string, listener: (...args: any[]) => void) => void
 
   /**
    * Destroys the underlying request stream.
@@ -112,6 +119,11 @@ export interface ApiResponse {
    * HTTP status code when available.
    */
   statusCode?: number
+
+  /**
+   * Indicates whether HTTP headers have been sent.
+   */
+  headersSent?: boolean
 
   /**
    * Writes response status and headers.
@@ -408,6 +420,31 @@ export interface ApiDosProtectionManager {
    * Checks the incoming request against DoS rules.
    */
   check: (req: ApiRequest) => ApiDosProtectionResult
+
+  /**
+   * Records a failed password attempt and jails IP if limit exceeded.
+   */
+  recordAuthFailure: (rawAddress?: string | null) => boolean
+
+  /**
+   * Tracks an active TCP socket and enforces max concurrent connections per IP.
+   */
+  incrementActiveSockets: (rawAddress?: string | null) => boolean
+
+  /**
+   * Decrements active TCP sockets when connection closes.
+   */
+  decrementActiveSockets: (rawAddress?: string | null) => void
+
+  /**
+   * Checks whether an IP address is currently blocked.
+   */
+  isIpBlocked: (rawAddress?: string | null) => boolean
+
+  /**
+   * Programmatically blocks an IP address.
+   */
+  blockIp: (rawAddress: string, durationMs: number, broadcast?: boolean) => void
 }
 
 /**
@@ -419,6 +456,11 @@ export interface ApiRateLimitManager {
    * Checks the incoming request against rate limit rules.
    */
   check: (req: ApiRequest, parsedUrl: URL) => ApiRateLimitResult
+
+  /**
+   * Checks incoming WebSocket upgrade handshakes against rate limits.
+   */
+  checkUpgrade: (req: ApiRequest, parsedUrl: URL) => ApiRateLimitResult
 }
 
 /**
@@ -446,9 +488,7 @@ export interface ApiNodelinkServer {
   /**
    * Loaded configuration.
    */
-  options: NodelinkConfig & {
-    server: NodelinkConfig['server'] & { maxBodySize?: number }
-  }
+  options: NodelinkConfig
 
   /**
    * Extension hooks.
@@ -469,4 +509,9 @@ export interface ApiNodelinkServer {
    * DoS protection instance.
    */
   dosProtectionManager: ApiDosProtectionManager
+
+  /**
+   * Adaptive admission control and multi-layer resource protection manager.
+   */
+  admissionManager: import('../../managers/admissionManager.ts').default
 }

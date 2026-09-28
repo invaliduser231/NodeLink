@@ -97,6 +97,7 @@ async function loadRoutes(): Promise<ApiRouteCollection> {
       if (
         file !== 'index.js' &&
         file !== 'index.ts' &&
+        !file.endsWith('.d.ts') &&
         (file.endsWith('.js') || file.endsWith('.ts'))
       ) {
         const filePath = join(__dirname, file)
@@ -332,81 +333,89 @@ async function requestHandler(
     }
   }
 
-  const dosCheck = nodelink.dosProtectionManager.check(req)
-  if (!dosCheck.allowed) {
-    logger(
-      'warn',
-      'DosProtection',
-      `DoS protection triggered for ${clientAddress} on ${parsedUrl.pathname}`
-    )
-    ;(res as unknown as { __traceReason?: string }).__traceReason =
-      'dos_protection'
-    nodelink.statsManager.incrementDosProtectionBlock(
-      remoteAddress,
-      dosCheck.message
-    )
-    sendErrorResponse(
-      req,
-      res,
-      dosCheck.status ?? 403,
-      dosCheck.message ?? 'Forbidden',
-      dosCheck.message ?? 'Forbidden',
-      parsedUrl.pathname,
-      trace
-    )
-    return
-  }
-  if (dosCheck.delay) {
-    await new Promise((resolve) => setTimeout(resolve, dosCheck.delay))
-  }
+  const admissionContext = nodelink.admissionManager.resolveContext(
+    req,
+    parsedUrl
+  )
+  const admissionDecision = nodelink.admissionManager.admit(admissionContext)
 
-  const rateLimitCheck = nodelink.rateLimitManager.check(req, parsedUrl)
   if (
-    rateLimitCheck.limit !== undefined &&
-    rateLimitCheck.remaining !== undefined &&
-    rateLimitCheck.reset !== undefined
+    admissionDecision.remainingTokens !== undefined &&
+    admissionDecision.capacityLimit !== undefined
   ) {
-    res.setHeader('X-RateLimit-Limit', rateLimitCheck.limit)
-    res.setHeader('X-RateLimit-Remaining', rateLimitCheck.remaining)
-    res.setHeader('X-RateLimit-Reset', Math.ceil(rateLimitCheck.reset / 1000))
+    res.setHeader('X-RateLimit-Limit', admissionDecision.capacityLimit)
+    res.setHeader('X-RateLimit-Remaining', admissionDecision.remainingTokens)
+
+    if (admissionDecision.resetTimestamp) {
+      res.setHeader(
+        'X-RateLimit-Reset',
+        Math.ceil(admissionDecision.resetTimestamp / 1000)
+      )
+      res.setHeader('RateLimit-Limit', admissionDecision.capacityLimit)
+      res.setHeader('RateLimit-Remaining', admissionDecision.remainingTokens)
+      res.setHeader(
+        'RateLimit-Reset',
+        Math.ceil(
+          Math.max(0, admissionDecision.resetTimestamp - Date.now()) / 1000
+        )
+      )
+      res.setHeader(
+        'RateLimit-Policy',
+        `${admissionDecision.capacityLimit};w=60`
+      )
+    }
   }
 
-  if (!rateLimitCheck.allowed) {
+  if (!admissionDecision.allowed) {
     logger(
       'warn',
-      'RateLimit',
-      `Rate limit exceeded for ${clientAddress} on ${parsedUrl.pathname}`
+      'Admission',
+      `Admission [${admissionDecision.scope}] rejected ${clientAddress} on ${parsedUrl.pathname}: ${admissionDecision.message}`
     )
     ;(res as unknown as { __traceReason?: string }).__traceReason =
-      'rate_limited'
-    nodelink.statsManager.incrementRateLimitHit(
-      parsedUrl.pathname,
-      remoteAddress
-    )
+      'admission_rejected'
 
-    const resetTime = rateLimitCheck.reset ?? Date.now()
-    const retryAfter = Math.ceil((resetTime - Date.now()) / 1000)
-    res.setHeader('Retry-After', retryAfter)
+    if (admissionDecision.retryAfterSeconds > 0) {
+      res.setHeader('Retry-After', admissionDecision.retryAfterSeconds)
+    }
 
     sendErrorResponse(
       req,
       res,
-      429,
-      'Too Many Requests',
-      'You are sending too many requests. Please try again later.',
+      admissionDecision.status,
+      admissionDecision.status === 403 ? 'Forbidden' : 'Too Many Requests',
+      admissionDecision.message,
       parsedUrl.pathname,
       trace
     )
     return
+  }
+
+  if (admissionDecision.releaseConcurrency) {
+    const release = admissionDecision.releaseConcurrency
+    const previousEnd = res.end.bind(res)
+    let released = false
+    const safeRelease = () => {
+      if (!released) {
+        released = true
+        release()
+      }
+    }
+
+    res.end = (...args: Parameters<ApiResponse['end']>) => {
+      safeRelease()
+      previousEnd(...args)
+    }
   }
 
   if (!isMetricsEndpoint && !isProfilerEndpoint) {
     const authHeader = getHeaderValue(headerAccess.authorization)
-    if (
-      !authHeader ||
-      (authHeader !== nodelink.options.server.password &&
-        authHeader !== `Bearer ${nodelink.options.server.password}`)
-    ) {
+    const serverPassword = nodelink.options.server.password
+    const isAuthValid =
+      authHeader === serverPassword || authHeader === `Bearer ${serverPassword}`
+
+    if (!isAuthValid) {
+      nodelink.admissionManager.recordAuthFailure(remoteAddress)
       logger(
         'warn',
         'Server',
@@ -421,7 +430,7 @@ async function requestHandler(
     }
   }
 
-  const MAX_BODY_SIZE = nodelink.options.server?.maxBodySize || 10 * 1024 * 1024
+  const MAX_BODY_SIZE = nodelink.options.server?.maxBodySize ?? 1024 * 1024
 
   let body = ''
   let parsedBody: unknown = body
@@ -448,16 +457,65 @@ async function requestHandler(
       return
     }
 
-    await new Promise<void>((resolve) => {
-      if (typeof req.on !== 'function') {
-        resolve()
+    const bodyReadSuccess = await new Promise<boolean>((resolve) => {
+      if (!req.on) {
+        resolve(true)
         return
       }
 
       let receivedSize = 0
+      const chunks: Buffer[] = []
+      let isSettled = false
+
+      const cleanup = () => {
+        if (timeoutId) {
+          clearTimeout(timeoutId)
+        }
+        req.removeListener?.('data', onData)
+        req.removeListener?.('end', onEnd)
+        req.removeListener?.('error', onError)
+      }
+
+      const settle = (success: boolean) => {
+        if (isSettled) return
+        isSettled = true
+        cleanup()
+        resolve(success)
+      }
+
+      const timeoutMs = nodelink.options.server?.bodyTimeout ?? 30_000
+      const timeoutId =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              logger(
+                'warn',
+                'Server',
+                `Request body read timed out after ${timeoutMs}ms: ${parsedUrl.pathname}`
+              )
+              ;(res as unknown as { __traceReason?: string }).__traceReason =
+                'body_timeout'
+              if (!res.headersSent) {
+                sendErrorResponse(
+                  req,
+                  res,
+                  408,
+                  'Request Timeout',
+                  'Request body read timed out.',
+                  parsedUrl.pathname,
+                  trace
+                )
+              }
+              try {
+                req.destroy?.()
+              } catch {}
+              settle(false)
+            }, timeoutMs)
+          : null
+      timeoutId?.unref?.()
 
       const onData = (chunk: Buffer) => {
-        receivedSize += chunk.length
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+        receivedSize += buf.length
         if (receivedSize > MAX_BODY_SIZE) {
           logger(
             'warn',
@@ -466,8 +524,6 @@ async function requestHandler(
           )
           ;(res as unknown as { __traceReason?: string }).__traceReason =
             'payload_too_large'
-          req.removeListener?.('data', onData)
-          req.removeListener?.('end', onEnd)
           sendErrorResponse(
             req,
             res,
@@ -477,56 +533,93 @@ async function requestHandler(
             parsedUrl.pathname,
             trace
           )
-          req.destroy?.()
-          resolve()
+          try {
+            req.destroy?.()
+          } catch {}
+          settle(false)
+          return
         }
-        body += chunk.toString()
+        chunks.push(buf)
       }
 
-      const onEnd = () => {
-        try {
-          const contentType = getHeaderValue(headerAccess['content-type'])
-          if (contentType?.includes('application/json') && body) {
-            parsedBody = JSON.parse(body)
-          }
-        } catch (error) {
-          const errorMessage =
-            error instanceof Error ? error.message : String(error)
-          logger(
-            'error',
-            'Server',
-            `Failed to parse JSON body: ${errorMessage}. Path: ${
-              parsedUrl.pathname
-            }, Content-Type: ${
-              getHeaderValue(headerAccess['content-type']) || 'N/A'
-            }, Raw Body: '${body}', Headers: ${JSON.stringify(req.headers)}`
-          )
-          pushTrace('events', {
-            ts: Date.now(),
-            type: 'json_parse_error',
-            path: parsedUrl.pathname,
-            method: req.method ?? 'UNKNOWN',
-            message: errorMessage
-          })
-          ;(res as unknown as { __traceReason?: string }).__traceReason =
-            'invalid_json'
+      const onError = (error: Error) => {
+        logger(
+          'error',
+          'Server',
+          `Error reading request body: ${error?.message || error}. Path: ${parsedUrl.pathname}`
+        )
+        ;(res as unknown as { __traceReason?: string }).__traceReason =
+          'socket_error'
+        if (!res.headersSent) {
           sendErrorResponse(
             req,
             res,
-            400,
-            'Invalid JSON',
-            errorMessage || 'Failed to parse JSON body',
+            500,
+            'Internal Server Error',
+            'Failed to read request body',
             parsedUrl.pathname,
             trace
           )
-          return
         }
-        resolve()
+        try {
+          req.destroy?.()
+        } catch {}
+        settle(false)
+      }
+
+      const onEnd = () => {
+        const rawBody = Buffer.concat(chunks).toString('utf8')
+        body = rawBody
+        parsedBody = rawBody
+        const contentType = getHeaderValue(headerAccess['content-type'])
+        if (contentType?.includes('application/json') && rawBody.length > 0) {
+          try {
+            parsedBody = JSON.parse(rawBody)
+          } catch (error) {
+            const errorMessage =
+              error instanceof Error ? error.message : String(error)
+            logger(
+              'error',
+              'Server',
+              `Failed to parse JSON body: ${errorMessage}. Path: ${
+                parsedUrl.pathname
+              }, Content-Type: ${
+                getHeaderValue(headerAccess['content-type']) || 'N/A'
+              }, Raw Body: '${rawBody}', Headers: ${JSON.stringify(req.headers)}`
+            )
+            pushTrace('events', {
+              ts: Date.now(),
+              type: 'json_parse_error',
+              path: parsedUrl.pathname,
+              method: req.method ?? 'UNKNOWN',
+              message: errorMessage
+            })
+            ;(res as unknown as { __traceReason?: string }).__traceReason =
+              'invalid_json'
+            sendErrorResponse(
+              req,
+              res,
+              400,
+              'Invalid JSON',
+              errorMessage || 'Failed to parse JSON body',
+              parsedUrl.pathname,
+              trace
+            )
+            settle(false)
+            return
+          }
+        }
+        settle(true)
       }
 
       req.on('data', onData)
       req.on('end', onEnd)
+      req.on('error', onError)
     })
+
+    if (!bodyReadSuccess) {
+      return
+    }
   }
   req.body = parsedBody
 

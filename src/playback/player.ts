@@ -92,7 +92,7 @@ export class Player {
   private readonly session: Session
   public readonly guildId: string
 
-  private track: PlayerTrack | null = null
+  public track: PlayerTrack | null = null
   private holoTrack: PlayerTrack | null = null
   private nextTrack: PlayerTrack | null = null
   private nextResource: AudioResource | null = null
@@ -162,7 +162,7 @@ export class Player {
 
   private _lastPosition = 0
   private _stuckTime = 0
-  private _lastStreamDataTime = 0
+  public _lastStreamDataTime = 0
   private _isRecovering = false
   public destroying = false
   public isUpdatingTrack = false
@@ -1411,7 +1411,7 @@ export class Player {
   /**
    * Sends player state updates to the client.
    */
-  private _sendUpdate(): boolean {
+  public _sendUpdate(): boolean {
     if (
       !this.connection ||
       (this.isPaused && !this._fadeTimers.pause) ||
@@ -2969,9 +2969,10 @@ export class Player {
     } else {
       this.isPaused = false
       this._isResuming = true
-      this._getAudioStream()?.setCrossfadePaused?.(false)
+      const audioStream = this._getAudioStream()
+      audioStream?.setCrossfadePaused?.(false)
       this._fading('resume')
-      this.connection?.unpause?.('requested')
+      if (audioStream) this.connection?.unpause?.('requested')
       this._rescheduleCrossfade(this._pausedAtPosition)
     }
 
@@ -4406,7 +4407,12 @@ export class Player {
       20,
       Math.min(boundedDuration, Math.round(Number(config.minBufferMs) || 250))
     )
-    const mode = config.mode === 'stream' ? 'stream' : 'preload'
+    const mode =
+      config.mode === 'stream'
+        ? 'stream'
+        : config.mode === 'smart'
+          ? 'smart'
+          : 'preload'
     const configuredBuffer = Math.round(Number(config.bufferMs) || 0)
     const bufferMs = Math.max(
       minBufferMs,

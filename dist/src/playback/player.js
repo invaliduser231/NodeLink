@@ -1969,9 +1969,11 @@ export class Player {
         else {
             this.isPaused = false;
             this._isResuming = true;
-            this._getAudioStream()?.setCrossfadePaused?.(false);
+            const audioStream = this._getAudioStream();
+            audioStream?.setCrossfadePaused?.(false);
             this._fading('resume');
-            this.connection?.unpause?.('requested');
+            if (audioStream)
+                this.connection?.unpause?.('requested');
             this._rescheduleCrossfade(this._pausedAtPosition);
         }
         this.emitEvent(GatewayEvents.PAUSE, { paused: this.isPaused });
@@ -3066,7 +3068,11 @@ export class Player {
         }
         const boundedDuration = Math.min(30000, Math.round(duration));
         const minBufferMs = Math.max(20, Math.min(boundedDuration, Math.round(Number(config.minBufferMs) || 250)));
-        const mode = config.mode === 'stream' ? 'stream' : 'preload';
+        const mode = config.mode === 'stream'
+            ? 'stream'
+            : config.mode === 'smart'
+                ? 'smart'
+                : 'preload';
         const configuredBuffer = Math.round(Number(config.bufferMs) || 0);
         const bufferMs = Math.max(minBufferMs, configuredBuffer > 0
             ? configuredBuffer

@@ -1,3 +1,8 @@
+import type { AdmissionConfig } from '../admission/admission.types.ts'
+import type { DosProtectionConfig } from '../api/dosProtection.types.ts'
+import type { RateLimitConfig } from '../api/rateLimit.types.ts'
+import type { RoutePlannerIpBlockEntry } from '../api/routeplanner.types.ts'
+
 /**
  * Selection of the internal engine used for networking and protocol handling.
  */
@@ -37,7 +42,7 @@ export interface AudioTransition {
   curve: string
 
   /** The technical logic type applied during the transition. */
-  type: string
+  type: 'volume' | 'tape' | 'scratch' | 'both'
 }
 
 /**
@@ -948,6 +953,44 @@ export interface ServerSection {
 
   /** Allow browser web players from any origin (permissive CORS). */
   cors: boolean
+
+  /** Maximum request body size in bytes. */
+  maxBodySize?: number
+
+  /** Request body timeout in milliseconds. */
+  bodyTimeout?: number
+
+  /** HTTP socket headers timeout in milliseconds. */
+  headersTimeout?: number
+
+  /** HTTP keep-alive timeout in milliseconds. */
+  keepAliveTimeout?: number
+
+  /** Automatic server self-update settings. */
+  autoUpdate?: AutoUpdateSection
+}
+
+export interface AutoUpdateSection {
+  /** Enable automatic self-updating of the server code. */
+  enabled?: boolean
+
+  /** Target update channel: 'dev' or 'stable'. Defaults to 'dev'. */
+  channel?: 'dev' | 'stable'
+
+  /** Whether to check for updates on server boot. Defaults to true. */
+  checkOnBoot?: boolean
+
+  /** Interval in milliseconds to check for updates in background (e.g. 3600000 = 1 hour). Set 0 to disable. */
+  checkInterval?: number
+
+  /** Automatically restart the server to apply the update. Defaults to true. */
+  autoRestart?: boolean
+
+  /** If false, waits for active players to drop to 0 before restarting. If true, disconnects players with code 5002. Defaults to false. */
+  forceRestart?: boolean
+
+  /** Timeout in milliseconds to wait for WebSockets to disconnect gracefully after sending code 5002. Defaults to 2000. */
+  drainTimeout?: number
 }
 
 /**
@@ -957,59 +1000,17 @@ export interface SecuritySection {
   /** Master auth password. */
   password?: string
 
-  /** Trust X-Forwarded-For headers. */
+  /** Trust proxy headers (X-Forwarded-For, CF-Connecting-IP, etc). */
   trustProxy: boolean
 
-  /** Anti-flooding protection. */
-  dosProtection: {
-    enabled: boolean
-    thresholds: {
-      /** Max requests in window. */
-      burstRequests: number
-      /** Sliding window size (ms). */
-      timeWindowMs: number
-    }
-    mitigation: {
-      /** Artificial response delay (ms). */
-      delayMs: number
-      /** access block duration (ms). */
-      blockDurationMs: number
-    }
-    ignore: {
-      userIds: string[]
-      guildIds: string[]
-      ips: string[]
-    }
-  }
+  /** Anti-flooding and DoS protection. */
+  dosProtection: DosProtectionConfig
 
-  /** fair-use API throttling. */
-  rateLimit: {
-    enabled: boolean
-    maxEntries: number
-    global: {
-      maxRequests: number
-      timeWindowMs: number
-    }
-    perIp: {
-      maxRequests: number
-      timeWindowMs: number
-    }
-    perUserId: {
-      maxRequests: number
-      timeWindowMs: number
-    }
-    perGuildId: {
-      maxRequests: number
-      timeWindowMs: number
-    }
-    /** Paths that bypass rate limiting. */
-    ignorePaths: string[]
-    ignore: {
-      userIds: string[]
-      guildIds: string[]
-      ips: string[]
-    }
-  }
+  /** Fair-use API and WebSocket rate limiting. */
+  rateLimit: RateLimitConfig
+
+  /** Adaptive admission control and multi-layer resource protection. */
+  admission?: AdmissionConfig
 
   /** Allow additional security-specific properties. */
   [key: string]: unknown
@@ -1101,12 +1102,28 @@ export interface LoggingSection {
   /** log level (e.g. 'info', 'debug'). */
   level: string
 
+  /** Sensitive data redaction configuration. */
+  redaction?: {
+    enabled?: boolean
+    mode?: 'mask' | 'trace' | 'off'
+    ips?: boolean
+    tokens?: boolean
+    passwords?: boolean
+    userPaths?: boolean
+    networkInfo?: boolean
+    cookies?: boolean
+    emails?: boolean
+    discordIds?: boolean
+    accountInfo?: boolean
+  }
+
   /** Disk logging settings. */
   file: {
     enabled: boolean
     path: string
     rotation: string
     ttlDays: number
+    redactSensitive?: boolean
   }
 
   /** Granular debug flags. */
@@ -1129,6 +1146,7 @@ export interface LoggingSection {
  * Connectivity health and multi-IP rotation.
  */
 export interface NetworkSection {
+  [key: string]: unknown
   /** Shared outbound proxy for sources and internals. */
   proxy: {
     enabled: boolean
@@ -1154,7 +1172,7 @@ export interface NetworkSection {
   routePlanner: {
     strategy: string
     bannedIpCooldown: number
-    ipBlocks: Array<string | { cidr: string }>
+    ipBlocks: RoutePlannerIpBlockEntry[]
   }
 }
 
@@ -1201,12 +1219,14 @@ export interface FilterConfig {
  * The consolidated NodeLink configuration schema.
  */
 export interface NodelinkConfig {
+  [key: string]: unknown
   server: ServerSection
   cluster: ClusterSection
   logging: LoggingSection
   connection: NetworkSection['connection']
   rateLimit: SecuritySection['rateLimit']
   dosProtection: SecuritySection['dosProtection']
+  admission?: AdmissionConfig
   trustProxy: boolean
   network: NetworkSection
   search: {
@@ -1259,7 +1279,7 @@ export interface NodelinkConfig {
         enabled: boolean
         duration: number
         curve: string
-        mode: 'preload' | 'stream'
+        mode: 'preload' | 'stream' | 'smart'
         minBufferMs: number
         bufferMs: number
       }
