@@ -93,6 +93,20 @@ test('migrateConfig maps legacy flat config to hierarchical structure', () => {
   assert.equal(migrated.server.password, 'legacy-pass')
 })
 
+test('migrateConfig keeps top-level sections that need no migration', () => {
+  const migrated = migrateConfig({
+    dosProtection: { enabled: false },
+    rateLimit: { enabled: false },
+    admission: { enabled: false },
+    trustProxy: true
+  }) as Record<string, unknown>
+
+  assert.deepEqual(migrated.dosProtection, { enabled: false })
+  assert.deepEqual(migrated.rateLimit, { enabled: false })
+  assert.deepEqual(migrated.admission, { enabled: false })
+  assert.equal(migrated.trustProxy, true)
+})
+
 test('migrateConfig preserves explicit hierarchical values over legacy duplicates', () => {
   const hybrid = {
     server: { password: 'server-password' },
