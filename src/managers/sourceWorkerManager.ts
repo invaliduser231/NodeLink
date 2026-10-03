@@ -458,6 +458,10 @@ class SourceWorkerManager {
       const index = this.workers.indexOf(worker)
       if (index === -1) return
       this.workers.splice(index, 1)
+      this._failRequestsOfWorker(
+        worker.id,
+        `Source worker manager ${worker.process.pid} exited`
+      )
       this.workerLoads.delete(worker.id)
 
       // Keep at least one source worker alive.
@@ -616,6 +620,30 @@ class SourceWorkerManager {
     try {
       worker.send(message)
     } catch {}
+  }
+
+  private _failRequestsOfWorker(workerId: number, reason: string): void {
+    for (const [id, request] of this.requests) {
+      if (request.workerId !== workerId) continue
+      request.settled = true
+      try {
+        if (!request.res.headersSent) {
+          request.res.writeHead(502, { 'Content-Type': 'application/json' })
+          request.res.end(
+            JSON.stringify({
+              timestamp: Date.now(),
+              status: 502,
+              error: 'Worker Error',
+              message: reason,
+              path: request.req.url
+            })
+          )
+        } else {
+          request.res.end()
+        }
+      } catch {}
+      this._cleanupRequest(id, request)
+    }
   }
 
   private _cleanupRequest(id: string, request: SourceRequestEntry): void {
