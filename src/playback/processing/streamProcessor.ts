@@ -65,6 +65,7 @@ import {
   type CrossfadePrepareOptions
 } from './CrossfadeController.ts'
 import { SilenceDetector } from './SilenceDetector.ts'
+import { type TeardownTarget, teardownPipe } from './streamTeardown.ts'
 
 type LibSampleRateModule = typeof import('@alexanderolsen/libsamplerate-js')
 let libSampleRatePromise: Promise<LibSampleRateModule> | null = null
@@ -804,20 +805,7 @@ class BaseAudioResource {
     }
 
     for (let i = this.pipes.length - 1; i >= 0; i--) {
-      const pipe = this.pipes[i] as Transform & {
-        resume?: () => void
-        abort?: () => void
-        unpipe?: () => void
-        cleanup?: () => void
-        removeAllListeners?: () => void
-        destroy?: () => void
-      }
-      pipe.resume?.()
-      pipe.abort?.()
-      pipe.unpipe?.()
-      pipe.cleanup?.()
-      pipe.removeAllListeners?.()
-      pipe.destroy?.()
+      teardownPipe(this.pipes[i] as unknown as TeardownTarget)
     }
 
     this.pipes.length = 0
