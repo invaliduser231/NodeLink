@@ -1,5 +1,6 @@
 import { PassThrough } from 'node:stream'
 import HLSHandler from '../../playback/hls/HLSHandler.ts'
+import { ignoreLateError } from '../../playback/processing/streamTeardown.ts'
 import type { SabrStreamConfig } from '../../typings/sources/sabr.types.ts'
 import type {
   SourceResult,
@@ -2342,6 +2343,7 @@ export default class YouTubeSource {
       cancelSignal.aborted = true
       stream.removeListener('drain', onDrain)
       responseStream.removeAllListeners()
+      responseStream.on('error', ignoreLateError)
       if (!responseStream.destroyed) responseStream.destroy()
       this.activeStreams.delete(streamKey)
       stream.removeListener('close', cleanup)
@@ -2453,6 +2455,7 @@ export default class YouTubeSource {
 
       if (activeRequest) {
         activeRequest.removeAllListeners()
+        activeRequest.on('error', ignoreLateError)
         if (!activeRequest.destroyed) activeRequest.destroy()
         activeRequest = null
       }
