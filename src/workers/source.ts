@@ -48,6 +48,11 @@ import {
   getHeadQueueLength
 } from './headQueue.ts'
 import {
+  describeWorkerError,
+  InflightTaskRegistry,
+  isStreamingTask
+} from './inflightTasks.ts'
+import {
   isStreamControlMessage,
   type StreamControlAction,
   StreamControlRegistry
@@ -216,6 +221,7 @@ if (isMainThread) {
   const workerPool: MicroWorker[] = []
   const taskQueue = createHeadQueue<TaskData>()
   const streamOwners: Map<string, MicroWorker> = new Map()
+  const inflightTasks = new InflightTaskRegistry<MicroWorker>()
   const queuedStreams: Map<string, StreamControlAction | null> = new Map()
   let lastScaleUpAt = 0
   let nextThreadId = initialThreadCount + 1
@@ -251,6 +257,7 @@ if (isMainThread) {
         processNextTask()
       } else if (msg.type === 'result') {
         const { socketPath, id, result, error } = msg
+        inflightTasks.settle(id)
         finishTask(socketPath, id, result, error)
 
         worker.load = Math.max(0, worker.load - 1)
@@ -261,11 +268,13 @@ if (isMainThread) {
         sendChatAction(msg.socketPath, msg.id, msg.data)
       } else if (msg.type === 'end') {
         streamOwners.delete(msg.id)
+        inflightTasks.settle(msg.id)
         sendStreamEnd(msg.socketPath, msg.id)
         worker.load = Math.max(0, worker.load - 1)
         processNextTask()
       } else if (msg.type === 'error') {
         streamOwners.delete(msg.id)
+        inflightTasks.settle(msg.id)
         sendStreamError(msg.socketPath, msg.id, msg.error)
         worker.load = Math.max(0, worker.load - 1)
         processNextTask()
@@ -279,12 +288,26 @@ if (isMainThread) {
         if (owner === worker) streamOwners.delete(streamId)
       }
 
+      const orphaned = inflightTasks.drainOwner(worker)
+      const failureReason = `Source micro-worker ${threadNumber} exited with code ${code}`
+      for (const entry of orphaned) {
+        if (isStreamingTask(entry.task)) {
+          sendStreamError(entry.socketPath, entry.id, failureReason)
+        } else {
+          finishTask(entry.socketPath, entry.id, undefined, failureReason)
+        }
+      }
+
       const loadInfo =
         worker.load > 0 ? ` (had ${worker.load} pending tasks)` : ''
+      const failedInfo =
+        orphaned.length > 0
+          ? `, failed ${orphaned.length} in-flight task(s)`
+          : ''
       nodelink.logger(
         'warn',
         'SourceWorker',
-        `Micro-worker ${threadNumber} exited with code ${code}${loadInfo}`
+        `Micro-worker ${threadNumber} exited with code ${code}${loadInfo}${failedInfo}`
       )
 
       if (workerPool.length < initialThreadCount && !process.exitCode) {
@@ -306,7 +329,7 @@ if (isMainThread) {
       nodelink.logger(
         'error',
         'SourceWorker',
-        `Micro-worker ${threadNumber} error: ${err.message}`
+        `Micro-worker ${threadNumber} error: ${describeWorkerError(err)}`
       )
     })
 
@@ -581,6 +604,7 @@ if (isMainThread) {
 
         if (pendingControl !== 'cancel') {
           if (task.task === 'loadStream') streamOwners.set(task.id, bestWorker)
+          inflightTasks.track(task, bestWorker)
           bestWorker.load++
           bestWorker.postMessage(task)
           if (pendingControl) {
@@ -694,6 +718,14 @@ if (isMainThread) {
     }
   }
   utils.initLogger(config)
+
+  process.on('uncaughtExceptionMonitor', (err, origin) => {
+    utils.logger(
+      'error',
+      'SourceWorker',
+      `Micro-worker ${workerData.threadId} fatal ${origin}: ${describeWorkerError(err)}`
+    )
+  })
 
   const nodelink: WorkerNodeLink = {
     options: config,
