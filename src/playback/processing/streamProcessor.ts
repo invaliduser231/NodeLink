@@ -648,7 +648,7 @@ class PCMFrameCounter extends Transform {
  * Emitting with zero 'error' listeners throws, which escapes as an uncaught
  * exception and kills the worker, so teardown races must never emit blindly.
  */
-const emitResourceError = (
+export const emitResourceError = (
   target:
     | {
         destroyed?: boolean
@@ -1391,7 +1391,7 @@ class SymphoniaDecoderStream extends Transform {
     if (callback) {
       callback(error)
     } else {
-      this.emit('error', error)
+      emitResourceError(this, error)
     }
   }
 
@@ -1679,7 +1679,7 @@ class AACDecoderStream extends Transform {
         this.isDecoderReady = true
         this._processPendingChunks()
       })
-      .catch((err: Error) => this.emit('error', err))
+      .catch((err: Error) => emitResourceError(this, err))
   }
 
   cleanup(): void {
@@ -2153,7 +2153,7 @@ class MP4ToAACStream extends Transform {
           this.push(pcm)
         })
         this.symphoniaDecoder.on('error', (err) => {
-          this.emit('error', err)
+          emitResourceError(this, err)
         })
         const fullBuffer = Buffer.concat(this.headerChunks)
         const reordered = reorderMp4Boxes(fullBuffer)
@@ -2873,7 +2873,7 @@ class FLVToAACStream extends Transform {
     })
 
     this.demuxer.on('error', (err: Error) => {
-      if (!this._aborted) this.emit('error', err)
+      if (!this._aborted) emitResourceError(this, err)
     })
   }
 

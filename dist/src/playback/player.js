@@ -3,6 +3,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { SeekError } from '@ecliptia/seekable-stream';
 import discordVoice from '@performanc/voice';
 import { EndReasons, GatewayEvents } from '../constants.js';
+import { YOUTUBE_WEBM_ITAGS } from '../sources/youtube/common.js';
 import { logger } from '../utils.js';
 import { AutoMixRegistry } from './processing/AutoMixRegistry.js';
 import { DuckingController } from './processing/DuckingController.js';
@@ -12,6 +13,26 @@ const trackFinishMemoryTraceEnabled = process.env.NODELINK_TRACK_FINISH_MEMORY_T
 const SEEK_CROSSFADE_SAFETY_MS = 15000;
 const MIN_CROSSFADE_SELECTION_MS = 6000;
 const MAX_CROSSFADE_SELECTION_MS = 21000;
+/**
+ * True for YouTube/ytmusic streams served as WebM/opus. Those must skip
+ * the generic seekable path: it keeps downloading the rest of the file
+ * into RAM while voice plays in realtime (measured: a 180MB file cost
+ * 2.8GB across 18 players, just a example when i was making this.). Unknown formats default to WebM, since
+ * itag 251 dominates and itag is always present in practice.
+ */
+function isWebmYouTubePlayback(sourceName, data) {
+    if (sourceName !== 'youtube' && sourceName !== 'ytmusic')
+        return false;
+    const itag = data?.additionalData?.itag;
+    if (typeof itag === 'number')
+        return YOUTUBE_WEBM_ITAGS.has(itag);
+    const format = data?.format;
+    if (typeof format === 'string')
+        return format.toLowerCase().includes('webm');
+    if (typeof format?.itag === 'number')
+        return YOUTUBE_WEBM_ITAGS.has(format.itag);
+    return true;
+}
 function getCrossfadeSelectionWindowMs(durationMs) {
     return Math.min(MAX_CROSSFADE_SELECTION_MS, Math.max(MIN_CROSSFADE_SELECTION_MS, durationMs * 4.2));
 }
@@ -98,6 +119,7 @@ export class Player {
     _stuckTime = 0;
     _lastStreamDataTime = 0;
     _isRecovering = false;
+    _resumePositionMs = null;
     destroying = false;
     isUpdatingTrack = false;
     _isRestoring = false;
@@ -264,6 +286,19 @@ export class Player {
             this.audioMixer = null;
         }
         this._audioMixerInitPromise = null;
+    }
+    _isVoiceReady() {
+        return (this.connStatus === 'connected' && !!this.connection?.udpInfo?.secretKey);
+    }
+    _ensureVoiceConnection() {
+        if (this.destroying || this._isVoiceReady())
+            return;
+        if (!this.voice.sessionId || !this.voice.token || !this.voice.endpoint)
+            return;
+        try {
+            this.updateVoice(this.voice, true);
+        }
+        catch { }
     }
     /**
      * Establishes the voice connection and attaches event listeners.
@@ -578,6 +613,14 @@ export class Player {
                 severity = 'suspicious';
                 cause = 'VOICE_STATE_TIMEOUT';
             }
+            else if (error.message.includes('Voice WS closed with reconnect code')) {
+                logger('warn', 'Player', `Voice websocket closed during reconnect burst for guild ${this.guildId}. Preserving track for resume.`);
+                severity = 'suspicious';
+                cause = 'VOICE_WS_RECONNECT_FAILED';
+                shouldStop = false;
+                this._resumePositionMs = this._realPosition();
+                this.updateVoice(this.voice, true);
+            }
             else if (error.message.includes('stream') ||
                 error.message.includes('timeout') ||
                 error.message.includes('timed out') ||
@@ -633,6 +676,7 @@ export class Player {
         this.isPaused = false;
         this.position = 0;
         this._pausedAtPosition = undefined;
+        this._resumePositionMs = null;
         this._lastStreamDataTime = 0;
         this.streamInfo = null;
         this.sponsorBlock.segments = [];
@@ -1175,13 +1219,16 @@ export class Player {
     /**
      * Starts playback for the current track.
      */
-    async _connectAndPlayStream(urlData, position, cleanupReason, fadingAction, playLogMessage, preserveQueuedCrossfade = false) {
+    async _connectAndPlayStream(urlData, position, cleanupReason, fadingAction, playLogMessage, preserveQueuedCrossfade = false, suppressErrorEvents = false) {
         if (!this.track)
             return false;
         if (!this.connection) {
             this._initConnection();
         }
-        if (!this.connection?.udpInfo?.secretKey) {
+        if (!this._isVoiceReady()) {
+            this._ensureVoiceConnection();
+        }
+        if (!this._isVoiceReady()) {
             logger('debug', 'Player', `Waiting for voice connection to be ready for guild ${this.guildId}`);
             try {
                 await this.waitEvent('stateChange', (s) => s.status === 'connected' && !!this.connection?.udpInfo?.secretKey);
@@ -1190,8 +1237,10 @@ export class Player {
                 logger('warn', 'Player', `Timeout or error while waiting for voice connection on guild ${this.guildId}:`, err);
             }
         }
-        if (!this.connection?.udpInfo?.secretKey) {
-            this._onError(new Error(`Voice connection timed out for guild ${this.guildId} (missing UDP info).`, { cause: 'VOICE_CONNECTION_TIMEOUT' }));
+        if (!this.connection || !this._isVoiceReady()) {
+            if (!suppressErrorEvents) {
+                this._onError(new Error(`Voice connection timed out for guild ${this.guildId} (missing UDP info).`, { cause: 'VOICE_CONNECTION_TIMEOUT' }));
+            }
             return false;
         }
         const resolvedSourceName = urlData.newTrack?.info
@@ -1200,6 +1249,7 @@ export class Player {
         const seekEligible = position > 0 &&
             !!urlData.url &&
             !unsupportedSeekSources.includes(resolvedSourceName) &&
+            !isWebmYouTubePlayback(resolvedSourceName, urlData) &&
             urlData.protocol !== 'sabr' &&
             urlData.protocol !== 'hls' &&
             urlData.protocol !== 'dash';
@@ -1220,8 +1270,10 @@ export class Player {
         if (!resource) {
             const fetched = await this._fetchResource(this.track.info, urlData, position);
             if ('exception' in fetched) {
-                const err = new Error(fetched.exception.message);
-                this._onError(err);
+                if (!suppressErrorEvents) {
+                    const err = new Error(fetched.exception.message);
+                    this._onError(err);
+                }
                 return false;
             }
             resource = fetched.stream;
@@ -1480,7 +1532,8 @@ export class Player {
             const hasSourceLoader = source?.loadStream;
             const canNativeSeek = !!hasSourceLoader &&
                 (this.streamInfo?.protocol === 'sabr' ||
-                    (sourceName === 'deezer' && resolvedSourceName === 'deezer'));
+                    (sourceName === 'deezer' && resolvedSourceName === 'deezer') ||
+                    isWebmYouTubePlayback(resolvedSourceName, this.streamInfo));
             if (forceLegacy) {
                 seekPromise = this._legacySeek(seekPosition, endTime === null ? undefined : (endTime ?? this.track.endTime));
             }
@@ -1578,6 +1631,23 @@ export class Player {
             ...this.track.info,
             audioTrackId: this.track.audioTrackId
         };
+        // Reuse the playing URL when it's a native WebM stream: resolving a
+        // fresh URL hits the cipher on every seek. A stale URL just fails
+        // here and falls through to the fresh resolve below.
+        const seekSourceName = this.streamInfo?.newTrack
+            ?.info?.sourceName ?? this.track.info.sourceName;
+        if (!reuseUrlData &&
+            this.streamInfo?.protocol !== 'sabr' &&
+            this.streamInfo?.protocol !== 'hls' &&
+            this.streamInfo?.protocol !== 'dash' &&
+            isWebmYouTubePlayback(seekSourceName, this.streamInfo) &&
+            this.streamInfo?.url) {
+            const cachedUrlData = this.streamInfo;
+            const cachedResult = await this._connectAndPlayStream(cachedUrlData, position, 'source-seek', 'seekPrepare', `Playing resource for guild ${this.guildId} after source seek (cached URL)`, false, true);
+            if (cachedResult)
+                return true;
+            logger('debug', 'Player', `Cached URL seek failed for guild ${this.guildId}, resolving fresh URL`);
+        }
         const urlData = reuseUrlData || (await this.nodelink.sources.getTrackUrl(trackInfo));
         this.streamInfo = { ...urlData, trackInfo: this.track.info };
         if (urlData.exception) {
@@ -1733,14 +1803,14 @@ export class Player {
         if (!this.connection) {
             this._initConnection();
         }
-        if (!this.connection?.udpInfo?.secretKey) {
-            logger('debug', 'Player', `Waiting for voice connection to be ready for guild ${this.guildId}`);
+        if (!this._isVoiceReady()) {
+            this._ensureVoiceConnection();
             try {
                 await this.waitEvent('stateChange', (s) => s.status === 'connected' && !!this.connection?.udpInfo?.secretKey);
             }
             catch { }
         }
-        if (!this.connection?.udpInfo?.secretKey) {
+        if (!this.connection || !this._isVoiceReady()) {
             this._onError(new Error(`Voice connection timed out for guild ${this.guildId} (missing UDP info).`, { cause: 'VOICE_CONNECTION_TIMEOUT' }));
             return false;
         }
@@ -2260,7 +2330,8 @@ export class Player {
             const connectionDead = !this.connection ||
                 this.connStatus === 'disconnected' ||
                 this.connStatus === 'destroyed' ||
-                !this.connection.voiceServer;
+                !this.connection.voiceServer ||
+                (this.connStatus === 'connected' && !this.connection.udpInfo?.secretKey);
             if (!changed && !force && !connectionDead) {
                 logger('debug', 'Player', `Voice state for guild ${this.guildId} is unchanged. Skipping update.`);
                 return;
@@ -2296,7 +2367,9 @@ export class Player {
                     !this.connection?.audioStream &&
                     !this.isUpdatingTrack) {
                     logger('debug', 'Player', `Voice state updated for guild ${this.guildId}, starting pending track.`);
-                    await this._startPlayback().catch((err) => {
+                    const resumeAt = this._resumePositionMs;
+                    this._resumePositionMs = null;
+                    await this._startPlayback(resumeAt ?? 0).catch((err) => {
                         logger('error', 'Player', `Failed to start pending track during voice update for guild ${this.guildId}:`, err);
                     });
                 }
