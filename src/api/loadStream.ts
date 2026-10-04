@@ -19,6 +19,7 @@ import type {
 } from '../typings/sources/source.types.ts'
 import type { EncodedTrackPayload } from '../typings/utils.types.ts'
 import { decodeTrack, logger, sendErrorResponse } from '../utils.ts'
+import { shouldUseSeekableReader } from '../workers/streamRouting.ts'
 
 /**
  * Cached dynamic import for the stream processor module.
@@ -33,13 +34,6 @@ const LOAD_STREAM_HEADERS = {
   'Transfer-Encoding': 'chunked',
   Connection: 'keep-alive'
 } as const
-
-/**
- * Sources whose stream URLs point at encrypted payloads. Their `loadStream(...)`
- * implementation performs the decryption, so the seekable range reader must not
- * fetch those URLs directly.
- */
-const SOURCES_REQUIRING_DECRYPTION = new Set(['deezer'])
 
 /**
  * Request payload accepted by the load stream endpoint.
@@ -823,23 +817,11 @@ async function handler(
     const streamProcessorRuntime = getStreamProcessorRuntime(runtime)
     const sourceName =
       urlResult.newTrack?.info?.sourceName ?? decodedTrack.info.sourceName
-    const isHls = urlResult.protocol === 'hls'
-    const isSabr = urlResult.protocol === 'sabr'
-    const isLocal = sourceName === 'local'
-    const requiresSourceDecryption = SOURCES_REQUIRING_DECRYPTION.has(
-      String(sourceName ?? '').toLowerCase()
-    )
 
     let pcmStream: DestroyableReadable | null = null
     let fetchedStream: DestroyableReadable | null = null
 
-    if (
-      urlResult.url &&
-      !isHls &&
-      !isLocal &&
-      !isSabr &&
-      !requiresSourceDecryption
-    ) {
+    if (urlResult.url && shouldUseSeekableReader(sourceName, urlResult)) {
       const resource = (await createSeekeableAudioResource(
         input.guildId || 'api-stream',
         urlResult.url,
