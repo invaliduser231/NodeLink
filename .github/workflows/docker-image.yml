@@ -1,13 +1,6 @@
 name: Docker Image CI
 
 on:
-  push:
-    branches:
-      - dev
-      - v3
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
   release:
     types: [published, created]
   workflow_dispatch:
