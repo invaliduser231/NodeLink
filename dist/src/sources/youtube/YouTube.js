@@ -1,10 +1,11 @@
 import { PassThrough } from 'node:stream';
 import HLSHandler from '../../playback/hls/HLSHandler.js';
-import { encodeTrack, getBestMatch, http1makeRequest, logger, makeRequest } from '../../utils.js';
+import { capTotalTracks, encodeTrack, getBestMatch, http1makeRequest, logger, makeRequest } from '../../utils.js';
 import CipherManager from './CipherManager.js';
 import { checkURLType, YOUTUBE_CONSTANTS, YOUTUBE_WEBM_ITAGS } from './common.js';
 import YouTubeLiveChat from './LiveChat.js';
 import OAuth from './OAuth.js';
+import { parsePlaylistMeta } from './playlistMeta.js';
 import { SabrStream } from './sabr/sabr.js';
 /** Size in bytes of each range-request chunk for direct HTTP streaming. */
 const CHUNK_SIZE = 64 * 1024;
@@ -379,117 +380,60 @@ export default class YouTubeSource {
         }
     }
     /**
-     * Fetches visitor data and player script URL from YouTube embed pages.
-     *
-     * Tries the embed endpoint first, then falls back to the guide API.
-     * Both visitor data and player script URL are cached in the credential
-     * manager for use by innertube clients.
-     *
-     * @returns Promise that resolves when the fetch attempt completes.
+     * Refreshes the shared visitor from service-worker data, falling back to guide.
+     * Keeps the current visitor when both requests fail. Player-script discovery
+     * and caching are handled separately by the cipher manager.
+     * @returns Promise that resolves when the refresh attempt completes.
+     * @internal
      */
     async _fetchVisitorData() {
-        const cachedPlayerScript = this.nodelink.credentialManager?.get('yt_player_script_url');
-        if (cachedPlayerScript) {
-            this.cipherManager.setPlayerScriptUrl(cachedPlayerScript);
-            logger('debug', 'YouTube', 'Player script URL loaded from cache.');
-        }
-        let visitorFound = false;
-        let playerScriptUrl = null;
+        const proxy = this.getProxy();
         try {
             const { body, error, statusCode } = await http1makeRequest('https://music.youtube.com/sw.js_data', {
                 method: 'GET',
                 responseType: 'buffer',
-                disableBodyCompression: true
+                disableBodyCompression: true,
+                proxy
             });
             if (!error && statusCode === 200) {
                 const text = body.toString('utf-8');
                 const json = text.slice(text.indexOf('\n') + 1);
-                const visitorData = this._extractVisitorData(JSON.parse(json));
-                if (visitorData) {
+                const data = JSON.parse(json);
+                // Structure is [key, timestamp, payload[]]
+                // and in payload[6] is visitorData value, from what i tested, it was always at that index.
+                const visitorData = data.find(([name]) => name === 'yt.sw.adr')?.[2]?.[6];
+                if (typeof visitorData === 'string' && visitorData) {
                     this.ytContext.client.visitorData = visitorData;
-                    visitorFound = true;
-                    logger('debug', 'YouTube', `visitorData obtained from sw.js_data endpoint (len=${visitorData.length})`);
+                    logger('debug', 'YouTube', 'visitorData refreshed from sw.js_data.');
+                    return;
                 }
             }
         }
-        catch (e) {
-            logger('debug', 'YouTube', `sw.js_data endpoint failed: ${e.message}`);
+        catch (error) {
+            logger('debug', 'YouTube', `sw.js_data endpoint failed: ${error.message}`);
         }
-        if (!visitorFound) {
-            try {
-                const { body: data, error, statusCode } = await makeRequest('https://www.youtube.com/embed', {
-                    method: 'GET',
-                    headers: {
-                        Cookie: 'YSC=LUAfwHpna4E; VISITOR_INFO1_LIVE=Zuih2uZbq3I;'
-                    }
-                });
-                if (!error && statusCode === 200) {
-                    const bodyStr = data;
-                    const visitorMatch = bodyStr?.match(/"VISITOR_DATA":"([^"]+)"/);
-                    if (visitorMatch?.[1]) {
-                        this.ytContext.client.visitorData = visitorMatch[1];
-                        visitorFound = true;
-                        logger('debug', 'YouTube', 'visitorData refreshed from embed.');
-                    }
-                    if (!cachedPlayerScript) {
-                        const playerScriptMatch = bodyStr?.match(/"jsUrl":"([^"]+)"/);
-                        if (playerScriptMatch?.[1]) {
-                            playerScriptUrl = playerScriptMatch[1].replace(/\/[a-z]{2}_[A-Z]{2}\//, '/en_US/');
-                            this.nodelink.credentialManager?.set('yt_player_script_url', playerScriptUrl, 12 * 60 * 60 * 1000);
-                            logger('debug', 'YouTube', `Player script URL: ${playerScriptUrl}`);
-                        }
-                    }
-                }
-                else {
-                    logger('warn', 'YouTube', `Embed request failed: ${error?.message || `Status ${statusCode}`}`);
-                }
-                if (!visitorFound) {
-                    const { body: guideData, error: guideError, statusCode: guideStatusCode } = await makeRequest('https://www.youtube.com/youtubei/v1/guide', {
-                        method: 'POST',
-                        body: { context: this.ytContext },
-                        disableBodyCompression: true
-                    });
-                    const guideBody = guideData;
-                    if (!guideError &&
-                        guideStatusCode === 200 &&
-                        guideBody?.responseContext?.visitorData) {
-                        this.ytContext.client.visitorData =
-                            guideBody.responseContext.visitorData;
-                        visitorFound = true;
-                        logger('debug', 'YouTube', 'visitorData refreshed via guide.');
-                    }
-                    else {
-                        logger('warn', 'YouTube', 'Failed to refresh visitorData via guide.');
-                    }
-                }
+        try {
+            const { body, error, statusCode } = await makeRequest('https://www.youtube.com/youtubei/v1/guide', {
+                method: 'POST',
+                body: { context: this.clients.Web?.getClient(this.ytContext) },
+                disableBodyCompression: true,
+                proxy
+            });
+            const visitorData = body?.responseContext?.visitorData;
+            if (!error &&
+                statusCode === 200 &&
+                typeof visitorData === 'string' &&
+                visitorData) {
+                this.ytContext.client.visitorData = visitorData;
+                logger('debug', 'YouTube', 'visitorData refreshed via guide.');
             }
-            catch (e) {
-                logger('error', 'YouTube', `Error fetching visitor data: ${e.message}`);
+            else {
+                logger('warn', 'YouTube', 'Failed to refresh visitorData via guide.');
             }
         }
-        if (playerScriptUrl)
-            this.cipherManager.setPlayerScriptUrl(playerScriptUrl);
-    }
-    /**
-     * Recursively searches the parsed `sw.js_data` payload for the visitor data
-     * token. The token is a protobuf-encoded base64 string embedded somewhere in
-     * the nested response arrays, so its exact position cannot be relied upon.
-     * @param node - Current payload node (array or string) being inspected.
-     * @returns The visitor data token, or `null` when not found.
-     * @internal
-     */
-    _extractVisitorData(node) {
-        if (typeof node === 'string') {
-            return /^Cg[A-Za-z0-9+/=_%-]{100,}$/.test(node) ? node : null;
+        catch (error) {
+            logger('warn', 'YouTube', `Error refreshing visitor data: ${error.message}`);
         }
-        if (Array.isArray(node)) {
-            for (const child of node) {
-                const found = this._extractVisitorData(child);
-                if (found)
-                    return found;
-            }
-        }
-        return null;
     }
     /**
      * Searches YouTube for tracks, playlists, or recommendations.
@@ -633,6 +577,9 @@ export default class YouTubeSource {
      */
     async resolve(url, type) {
         const result = await this._resolveWorker(url, type);
+        if (result.loadType === 'playlist') {
+            await this._applyPlaylistMeta(url, result.data);
+        }
         if (this.config.mirrorOfficialAlbums &&
             url.includes('list=OLAK') &&
             result.loadType === 'playlist') {
@@ -651,6 +598,67 @@ export default class YouTubeSource {
             }
         }
         return result;
+    }
+    /**
+     * Fills the collection metadata (`type`, `identifier`, `url`, `artworkUrl`,
+     * `author`, `totalTracks`) in `pluginInfo` on a resolved playlist.
+     *
+     * The innertube `next`/`browse` responses used by the clients don't carry the
+     * playlist owner or cover art, so those are read from the public playlist
+     * page instead. Best-effort: any failure leaves them empty, and values a
+     * client already provided are never overwritten.
+     * @internal
+     */
+    async _applyPlaylistMeta(url, playlist) {
+        if (!playlist?.info)
+            return;
+        const playlistId = url.match(/[?&]list=([\w-]+)/)?.[1];
+        if (!playlistId)
+            return;
+        const current = playlist.pluginInfo ?? {};
+        const meta = current.author && current.artworkUrl
+            ? { author: '', thumbnail: '' }
+            : await this._fetchPlaylistMeta(playlistId);
+        playlist.pluginInfo = {
+            ...current,
+            type: current.type ?? 'playlist',
+            identifier: current.identifier ?? playlistId,
+            url: current.url ?? `https://www.youtube.com/playlist?list=${playlistId}`,
+            artworkUrl: current.artworkUrl || meta.thumbnail,
+            author: current.author || meta.author,
+            totalTracks: capTotalTracks(current.totalTracks ?? playlist.tracks.length, this.nodelink.options.playback?.maxPlaylistLength)
+        };
+    }
+    /**
+     * Scrapes the playlist page for its owner and thumbnail.
+     * @param playlistId - YouTube playlist ID (`PL...`, `OLAK...`, etc.).
+     * @internal
+     */
+    async _fetchPlaylistMeta(playlistId) {
+        const empty = { author: '', thumbnail: '' };
+        const proxy = this.getProxy();
+        const startedAt = Date.now();
+        try {
+            const { body, statusCode } = await makeRequest(`https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}&hl=en`, {
+                method: 'GET',
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    // Skips the EU cookie-consent interstitial.
+                    Cookie: 'SOCS=CAI'
+                },
+                timeout: 5000,
+                proxy: proxy
+            });
+            this.reportProxyStatus(proxy, statusCode === 200, statusCode ?? 0, Date.now() - startedAt);
+            if (statusCode !== 200 || typeof body !== 'string')
+                return empty;
+            return parsePlaylistMeta(body);
+        }
+        catch (err) {
+            logger('debug', 'YouTube', `Failed to fetch playlist metadata for ${playlistId}: ${err instanceof Error ? err.message : String(err)}`);
+            return empty;
+        }
     }
     /**
      * Internal worker for URL resolution.
@@ -791,6 +799,12 @@ export default class YouTubeSource {
             const client = this.clients[clientName];
             if (!client)
                 continue;
+            const oauthRejection = this.rejectOAuthClientWithoutToken(clientName);
+            if (oauthRejection) {
+                clientErrors.push({ client: clientName, message: oauthRejection });
+                logger('error', 'YouTube', oauthRejection);
+                continue;
+            }
             if (!isMusicUrl && clientName === 'Music')
                 continue;
             if (isMusicUrl && clientName !== 'Music' && type !== 'youtube-fallback') {
@@ -868,6 +882,23 @@ export default class YouTubeSource {
             logger('error', 'YouTube', `Failed to resolve Holo track: ${err.message}`);
             return vanillaTrack;
         }
+    }
+    /**
+     * Rejects OAuth-only clients (TV family) without a configured refresh
+     * token, before they waste a resolve attempt and fail confusingly.
+     * Token-less metadata lookups go through oEmbed, not clients.
+     *
+     * @param clientName - Client to check.
+     * @returns Skip message, or null when the client can be used.
+     */
+    rejectOAuthClientWithoutToken(clientName) {
+        const client = this.clients[clientName];
+        if (client?.requiresOAuth?.() && !client.oauth?.hasRefreshToken?.()) {
+            return (`Client ${clientName} requires a YouTube refresh token and none is ` +
+                `configured (enable sources.youtube.getOAuthToken to generate one ` +
+                `or set clients.settings.${clientName}.refreshToken). Skipping.`);
+        }
+        return null;
     }
     /**
      * Resolves the playable stream URL for a decoded track.
@@ -948,6 +979,12 @@ export default class YouTubeSource {
             const client = this.clients[clientName];
             if (!client)
                 continue;
+            const oauthRejection = this.rejectOAuthClientWithoutToken(clientName);
+            if (oauthRejection) {
+                clientErrors.push({ client: clientName, message: oauthRejection });
+                logger('error', 'YouTube', oauthRejection);
+                continue;
+            }
             try {
                 logger('debug', 'YouTube', `Attempting to get track URL for ${decodedTrack.title} with client: ${clientName}`);
                 const proxyToUse = this.getProxy(true);
@@ -2139,8 +2176,7 @@ export default class YouTubeSource {
             const seekMime = availableFormats.find((formatEntry) => formatEntry.itag === currentItag)
                 ?.mimeType || '';
             const seekIsWebm = seekMime.toLowerCase().includes('webm') ||
-                (typeof currentItag === 'number' &&
-                    YOUTUBE_WEBM_ITAGS.has(currentItag));
+                (typeof currentItag === 'number' && YOUTUBE_WEBM_ITAGS.has(currentItag));
             if (!seekIsWebm) {
                 logger('warn', 'YouTube', `Ignoring startTime seek for non-WebM itag ${currentItag} on "${decodedTrack.title}", playing from start`);
                 effectiveSeekMs = 0;

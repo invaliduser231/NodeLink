@@ -696,6 +696,7 @@ class SymphoniaDecoderStream extends Transform {
     decoder;
     codecRegistryHint;
     flushCallback;
+    transformCallback;
     inputClosed;
     isFinished;
     _aborted;
@@ -712,6 +713,7 @@ class SymphoniaDecoderStream extends Transform {
         this.decoder = new SymphoniaDecoder();
         this.codecRegistryHint = codecRegistryHint ?? null;
         this.flushCallback = null;
+        this.transformCallback = null;
         this.inputClosed = false;
         this.isFinished = false;
         this._aborted = false;
@@ -750,7 +752,13 @@ class SymphoniaDecoderStream extends Transform {
                 this.decoder.initialize(this.codecRegistryHint);
             }
             this._scheduleDecode();
-            callback();
+            if (this.decoder.isProbed &&
+                this.decoder.bufferedBytes >= BUFFER_THRESHOLDS.maxCompressed) {
+                this.transformCallback = callback;
+            }
+            else {
+                callback();
+            }
         }
         catch (err) {
             callback(err);
@@ -824,6 +832,13 @@ class SymphoniaDecoderStream extends Transform {
         }
         finally {
             this._isDecoding = false;
+            if (this.transformCallback &&
+                this.decoder &&
+                this.decoder.bufferedBytes < BUFFER_THRESHOLDS.minCompressed) {
+                const callback = this.transformCallback;
+                this.transformCallback = null;
+                callback();
+            }
         }
     }
     _finishDecode() {
@@ -834,8 +849,9 @@ class SymphoniaDecoderStream extends Transform {
         callback?.();
     }
     _failDecode(err) {
-        const callback = this.flushCallback;
+        const callback = this.flushCallback ?? this.transformCallback;
         this.flushCallback = null;
+        this.transformCallback = null;
         this.isFinished = true;
         this._cleanup();
         const error = err instanceof Error ? err : new Error(`Symphonia decode failed: ${err}`);
@@ -882,10 +898,10 @@ class SymphoniaDecoderStream extends Transform {
             this.flushCallback = null;
             cb(err);
         }
-        this._cleanup();
+        this._cleanup(err);
         super._destroy(err, callback);
     }
-    _cleanup() {
+    _cleanup(error) {
         this._cancelTimers();
         if (this.decoder) {
             try {
@@ -893,6 +909,11 @@ class SymphoniaDecoderStream extends Transform {
             }
             catch { }
             this.decoder = null;
+        }
+        if (this.transformCallback) {
+            const callback = this.transformCallback;
+            this.transformCallback = null;
+            callback(error);
         }
     }
 }
@@ -2395,8 +2416,8 @@ class StreamAudioResource extends BaseAudioResource {
                 type: 's16le',
                 volume,
                 enableAGC,
-                lookaheadMs: this.nodelink?.options?.audio?.lookaheadMs,
-                gateThresholdLUFS: this.nodelink?.options?.audio?.gateThresholdLUFS
+                lookaheadMs: this.nodelink?.options?.playback?.audio?.lookaheadMs,
+                gateThresholdLUFS: this.nodelink?.options?.playback?.audio?.gateThresholdLUFS
             });
             pipeline(pcmStream, volumeTransformer, (err) => {
                 if (err && !this._destroyed) {
@@ -2478,7 +2499,7 @@ export const createSeekeableAudioResource = async (guildId, url, seekTime, endTi
                     emitResourceError(passthroughStream, err);
             });
             const format = hinted || (ext ? ext : 'm4a');
-            return new StreamAudioResource(guildId, passthroughStream, format, nodelink, initialFilters, volume, audioMixer, returnPCM, returnPCM ? true : (player.loudnessNormalizer ?? enableAGC), enableCrossfade);
+            return new StreamAudioResource(guildId, passthroughStream, format, nodelink, initialFilters, volume, audioMixer, returnPCM, player.loudnessNormalizer ?? enableAGC, enableCrossfade);
         }
         const { stream, meta } = (await seekableStream(url, seekTime, endTime, {}, _createSeekableProxyRequest(seekProxy)));
         const passthroughStream = new PassThrough({
@@ -2492,14 +2513,14 @@ export const createSeekeableAudioResource = async (guildId, url, seekTime, endTi
                 emitResourceError(passthroughStream, err);
         });
         const format = meta.codec?.container || player.streamInfo?.format;
-        return new StreamAudioResource(guildId, passthroughStream, format, nodelink, initialFilters, volume, audioMixer, returnPCM, returnPCM ? true : (player.loudnessNormalizer ?? enableAGC), enableCrossfade);
+        return new StreamAudioResource(guildId, passthroughStream, format, nodelink, initialFilters, volume, audioMixer, returnPCM, player.loudnessNormalizer ?? enableAGC, enableCrossfade);
     }
     catch (err) {
         const cause = err instanceof SeekError ? err.code : 'UNKNOWN';
         return _createErrorResponse(err.message, cause);
     }
 };
-export const createPCMStream = (_guildId, stream, type, nodelink, volume = 1.0, filters = {}) => {
+export const createPCMStream = (_guildId, stream, type, nodelink, volume = 1.0, filters = {}, enableAGC = false) => {
     const resamplingQuality = nodelink.options.playback.audio?.resamplingQuality || 'fastest';
     const normalizedType = normalizeFormat(type);
     const streams = [stream];
@@ -2563,7 +2584,13 @@ export const createPCMStream = (_guildId, stream, type, nodelink, volume = 1.0, 
         default:
             throw new Error(`Unsupported audio format: '${type}'`);
     }
-    streams.push(new VolumeTransformer({ type: 's16le', volume }));
+    streams.push(new VolumeTransformer({
+        type: 's16le',
+        volume,
+        enableAGC,
+        lookaheadMs: nodelink.options.playback.audio?.lookaheadMs,
+        gateThresholdLUFS: nodelink.options.playback.audio?.gateThresholdLUFS
+    }));
     streams.push(new FiltersManager(nodelink, filters));
     for (const s of streams) {
         if (s !== stream) {

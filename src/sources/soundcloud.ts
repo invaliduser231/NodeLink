@@ -1,4 +1,4 @@
-import { PassThrough, type Readable } from 'node:stream'
+import { PassThrough } from 'node:stream'
 import HLSHandler from '../playback/hls/HLSHandler.ts'
 import {
   SEARCH_TYPE_MAP,
@@ -16,10 +16,17 @@ import {
 import type {
   SourceResult,
   TrackInfo,
+  TrackStreamResult,
   TrackUrlResult
 } from '../typings/sources/source.types.ts'
 import type { TrackEncodeInput } from '../typings/utils.types.ts'
-import { encodeTrack, http1makeRequest, logger, makeRequest } from '../utils.ts'
+import {
+  capTotalTracks,
+  encodeTrack,
+  http1makeRequest,
+  logger,
+  makeRequest
+} from '../utils.ts'
 
 const BASE_URL = 'https://api-v2.soundcloud.com'
 const SOUNDCLOUD_URL = 'https://soundcloud.com'
@@ -680,10 +687,37 @@ export default class SoundCloudSource implements SoundCloudSourceState {
           name: body.title || 'Untitled playlist',
           selectedTrack: 0
         },
-        pluginInfo: {},
+        pluginInfo: {
+          type: 'playlist',
+          identifier: String(body.id ?? ''),
+          url: body.permalink_url ?? '',
+          artworkUrl: this._upgradeArtworkUrl(
+            body.artwork_url ??
+              tracks.find((track) => track.info.artworkUrl)?.info.artworkUrl
+          ),
+          author: body.user?.username?.trim() || '',
+          totalTracks: capTotalTracks(
+            body.track_count ?? body.tracks?.length ?? tracks.length,
+            limit
+          )
+        },
         tracks
       }
     }
+  }
+
+  /**
+   * Upgrades a SoundCloud artwork URL to the 500x500 variant.
+   * The API returns the 100x100 `-large` size; `original` is left untouched.
+   * @param url - Artwork URL from the API.
+   * @returns The upgraded URL, or an empty string when there is none.
+   */
+  _upgradeArtworkUrl(url?: string | null): string {
+    if (!url) return ''
+    return url.replace(
+      /-(?:large|small|tiny|badge|mini|crop|t\d+x\d+)(\.[a-z0-9]+)(?=$|\?)/i,
+      '-t500x500$1'
+    )
   }
 
   _processTracks(
@@ -817,8 +851,12 @@ export default class SoundCloudSource implements SoundCloudSourceState {
   async _selectTranscoding(
     body: SoundCloudApiTrack
   ): Promise<SoundCloudStreamUrlResult> {
-    const transcodings: SoundCloudApiTranscoding[] =
+    const transcodings: SoundCloudApiTranscoding[] = (
       body.media?.transcodings ?? []
+    ).filter((transcoding) => {
+      const protocol = transcoding.format?.protocol ?? 'progressive'
+      return protocol === 'progressive' || protocol === 'hls'
+    })
 
     if (!transcodings.length && (body.hls_aac_160_url || body.hls_aac_96_url)) {
       if (body.hls_aac_160_url) {
@@ -839,6 +877,19 @@ export default class SoundCloudSource implements SoundCloudSourceState {
     }
 
     if (transcodings.length === 0) {
+      const hasDrm = body.media?.transcodings?.some(
+        (transcoding) =>
+          transcoding.format?.protocol === 'cbc-encrypted-hls' ||
+          transcoding.format?.protocol === 'ctr-encrypted-hls'
+      )
+      if (hasDrm) {
+        return this._buildException(
+          'Track only provides DRM-protected SoundCloud streams, which are not supported'
+        )
+      }
+      if (body.media?.transcodings?.length) {
+        return this._buildException('No supported transcodings available')
+      }
       return this._buildException('No transcodings available')
     }
 
@@ -959,7 +1010,7 @@ export default class SoundCloudSource implements SoundCloudSourceState {
     url: string,
     protocol?: string,
     additionalData?: { format?: string; startTime?: number }
-  ): Promise<{ stream: Readable; type?: string }> {
+  ): Promise<TrackStreamResult> {
     if (protocol === 'progressive') {
       const stream = new PassThrough()
       this._handleProgressive(url, stream)
@@ -982,9 +1033,7 @@ export default class SoundCloudSource implements SoundCloudSourceState {
       })
       return { stream, type }
     } else {
-      const stream = new PassThrough()
-      stream.destroy(new Error(`Unsupported protocol: ${protocol}`))
-      return { stream }
+      return this._buildException(`Unsupported protocol: ${protocol}`)
     }
   }
 

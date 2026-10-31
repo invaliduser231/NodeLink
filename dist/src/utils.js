@@ -11,7 +11,7 @@ import util from 'node:util';
 import zlib from 'node:zlib';
 import packageJson from '../package.json' with { type: 'json' };
 import { DEFAULT_MAX_REDIRECTS, DISCORD_ID_REGEX, REDIRECT_STATUS_CODES, SEMVER_PATTERN } from './constants.js';
-import { LogSanitizer, defaultSanitizer } from './utils/sanitizer.js';
+import { defaultSanitizer, LogSanitizer } from './utils/sanitizer.js';
 /**
  * Reference to the runtime NodeLink instance stored on the global object.
  *
@@ -86,7 +86,7 @@ const logLevels = {
 };
 let loggingConfig = {};
 let currentLogLevel = logLevels.info;
-let logSanitizer = defaultSanitizer;
+const logSanitizer = defaultSanitizer;
 let logStream = null;
 let gitInfoCache = null;
 let currentLogFile = null;
@@ -386,6 +386,57 @@ function getVersion(type = 'string') {
     }
     return undefined;
 }
+const dependencyVersionCache = new Map();
+/**
+ * Resolves the installed version and git commit hash of a dependency.
+ *
+ * Checks `node_modules/<depName>/package.json` for the semver version and
+ * inspects `package-lock.json` for resolved git commit references.
+ *
+ * @param depName - Name of the dependency (e.g. '@performanc/voice').
+ * @returns Formatted version string (e.g. "2.2.15 (93f3e3b)") or "unknown".
+ * @public
+ */
+function getDependencyVersion(depName) {
+    const cached = dependencyVersionCache.get(depName);
+    if (cached)
+        return cached;
+    let version = '';
+    let commit = '';
+    try {
+        const pkgPath = path.resolve(process.cwd(), 'node_modules', depName, 'package.json');
+        if (fs.existsSync(pkgPath)) {
+            const data = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            if (data.version) {
+                version = data.version;
+            }
+        }
+    }
+    catch { }
+    try {
+        const lockPath = path.resolve(process.cwd(), 'package-lock.json');
+        if (fs.existsSync(lockPath)) {
+            const lockData = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+            const resolved = lockData.packages?.[`node_modules/${depName}`]?.resolved;
+            if (resolved?.includes('#')) {
+                commit = resolved.split('#')[1]?.slice(0, 7) || '';
+            }
+        }
+    }
+    catch { }
+    let result = 'unknown';
+    if (version && commit) {
+        result = `${version} (${commit})`;
+    }
+    else if (version) {
+        result = version;
+    }
+    else if (commit) {
+        result = commit;
+    }
+    dependencyVersionCache.set(depName, result);
+    return result;
+}
 /**
  * Applies track modifiers to payloads before serialization.
  *
@@ -518,6 +569,26 @@ function getGitInfo() {
     }
     if (gitInfoCache)
         return gitInfoCache;
+    const envCommit = (process.env.GIT_COMMIT || process.env.NODELINK_GIT_COMMIT)?.trim();
+    if (envCommit && envCommit !== 'unknown') {
+        const branch = (process.env.GIT_BRANCH || process.env.NODELINK_GIT_BRANCH)?.trim() ||
+            'unknown';
+        const rawTime = process.env.GIT_COMMIT_TIME ||
+            process.env.BUILD_TIME ||
+            process.env.NODELINK_BUILD_TIME;
+        const parsedTime = rawTime ? Number.parseInt(rawTime.trim(), 10) : 0;
+        const commitTime = Number.isFinite(parsedTime) && parsedTime > 0
+            ? parsedTime < 1e12
+                ? parsedTime * 1000
+                : parsedTime
+            : Date.now();
+        gitInfoCache = {
+            branch,
+            commit: envCommit.length > 7 ? envCommit.slice(0, 7) : envCommit,
+            commitTime
+        };
+        return gitInfoCache;
+    }
     try {
         const output = execSync('git log -1 --format=%D%n%h%n%ct', {
             encoding: 'utf8'
@@ -1169,6 +1240,7 @@ async function _internalHttp1Request(urlString, options = {}) {
         const cleanupReq = () => {
             req.removeListener('error', reqErrorHandler);
             req.removeListener('timeout', reqTimeoutHandler);
+            req.removeListener('close', cleanupReq);
         };
         req = lib.request(reqOptions, (res) => {
             const { statusCode, headers: respHeaders } = res;
@@ -1254,16 +1326,30 @@ async function _internalHttp1Request(urlString, options = {}) {
                 finalStream = res.pipe(zlib.createInflate());
             }
             let cleanupBody;
-            res.on('error', (err) => {
+            const responseErrorHandler = (err) => {
                 cleanupBody?.();
                 cleanupReq();
                 reject(new Error(`Response error for ${urlString}: ${err.message}`));
-            });
+            };
+            const responseCloseHandler = () => {
+                res.removeListener('error', responseErrorHandler);
+                if (finalStream === res)
+                    cleanupBody?.();
+                cleanupReq();
+            };
+            res.on('error', responseErrorHandler);
+            res.once('close', responseCloseHandler);
             if (finalStream !== res) {
-                finalStream.on('error', (err) => {
+                const decompressionErrorHandler = (err) => {
                     cleanupBody?.();
                     cleanupReq();
                     reject(new Error(`Decompression error for ${urlString}: ${err.message}`));
+                };
+                finalStream.on('error', decompressionErrorHandler);
+                finalStream.once('close', () => {
+                    finalStream.removeListener('error', decompressionErrorHandler);
+                    cleanupBody?.();
+                    cleanupReq();
                 });
             }
             if (streamOnly) {
@@ -1334,6 +1420,7 @@ async function _internalHttp1Request(urlString, options = {}) {
         });
         req.on('error', reqErrorHandler);
         req.on('timeout', reqTimeoutHandler);
+        req.once('close', cleanupReq);
         if (payloadBuffer) {
             req.end(payloadBuffer);
         }
@@ -2261,4 +2348,21 @@ async function fetchSponsorBlockSegments(videoId, categories, actionTypes, apiBa
         return [];
     }
 }
-export { applyEnvOverrides, checkDependencyUpdates, checkForUpdates, cleanupHttpAgents, cleanupLogger, decodeTrack, encodeTrack, fetchSponsorBlockSegments, generateRandomLetters, getGitInfo, getStats, getVersion, http1makeRequest, initLogger, logger, makeRequest, parseClient, parseSemver, sendErrorResponse, sendResponse, LogSanitizer, defaultSanitizer, validateProperty, verifyDiscordID, verifyMethod };
+/**
+ * Caps a collection's reported track count at the configured
+ * `playback.maxPlaylistLength`.
+ *
+ * A source may hold more tracks than NodeLink will ever load, so the total it
+ * reports should not exceed what a client can actually receive. An unset,
+ * zero, negative or non-numeric cap means "no cap".
+ *
+ * @param total - Track count as reported by the source.
+ * @param max - Configured `playback.maxPlaylistLength`.
+ * @returns `Math.min(total, max)`, or `total` when there is no usable cap.
+ */
+function capTotalTracks(total, max) {
+    return typeof max === 'number' && Number.isFinite(max) && max > 0
+        ? Math.min(total, max)
+        : total;
+}
+export { applyEnvOverrides, capTotalTracks, checkDependencyUpdates, checkForUpdates, cleanupHttpAgents, cleanupLogger, decodeTrack, defaultSanitizer, encodeTrack, fetchSponsorBlockSegments, generateRandomLetters, getDependencyVersion, getGitInfo, getStats, getVersion, http1makeRequest, initLogger, LogSanitizer, logger, makeRequest, parseClient, parseSemver, sendErrorResponse, sendResponse, validateProperty, verifyDiscordID, verifyMethod };

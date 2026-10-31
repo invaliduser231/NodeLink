@@ -225,6 +225,7 @@ export const config = {
             baseCapacity: 500,
             refillRatePerSecond: 100,
             maxConcurrentSockets: 25,
+            maxProxySockets: 1024,
             ipv6SubnetMask: 64,
             blockScoreThreshold: 30,
             blockDurationMs: 300000,
@@ -380,6 +381,7 @@ export const config = {
     api: {
         enableTrackStreamEndpoint: false,
         enableLoadStreamEndpoint: false,
+        enableHlsEndpoint: false,
         metrics: {
             enabled: true,
             authorization: {

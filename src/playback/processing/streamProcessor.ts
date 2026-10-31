@@ -1048,6 +1048,7 @@ class SymphoniaDecoderStream extends Transform {
   private decoder: SymphoniaDecoderLike | null
   private readonly codecRegistryHint: string | null
   private flushCallback: TransformCallback | null
+  private transformCallback: TransformCallback | null
   private inputClosed: boolean
   private isFinished: boolean
   private _aborted: boolean
@@ -1076,6 +1077,7 @@ class SymphoniaDecoderStream extends Transform {
     this.decoder = new SymphoniaDecoder() as SymphoniaDecoderLike
     this.codecRegistryHint = codecRegistryHint ?? null
     this.flushCallback = null
+    this.transformCallback = null
     this.inputClosed = false
     this.isFinished = false
     this._aborted = false
@@ -1381,8 +1383,9 @@ class SymphoniaDecoderStream extends Transform {
   }
 
   _failDecode(err: unknown): void {
-    const callback = this.flushCallback
+    const callback = this.flushCallback ?? this.transformCallback
     this.flushCallback = null
+    this.transformCallback = null
     this.isFinished = true
     this._cleanup()
 
@@ -1440,11 +1443,11 @@ class SymphoniaDecoderStream extends Transform {
       cb(err)
     }
 
-    this._cleanup()
+    this._cleanup(err)
     super._destroy(err, callback)
   }
 
-  _cleanup(): void {
+  _cleanup(error?: Error | null): void {
     this._cancelTimers()
 
     if (this.decoder) {
@@ -3359,8 +3362,9 @@ class StreamAudioResource extends BaseAudioResource {
         type: 's16le',
         volume,
         enableAGC,
-        lookaheadMs: this.nodelink?.options?.audio?.lookaheadMs,
-        gateThresholdLUFS: this.nodelink?.options?.audio?.gateThresholdLUFS
+        lookaheadMs: this.nodelink?.options?.playback?.audio?.lookaheadMs,
+        gateThresholdLUFS:
+          this.nodelink?.options?.playback?.audio?.gateThresholdLUFS
       })
 
       pipeline(pcmStream, volumeTransformer, (err: Error | null): void => {
@@ -3527,7 +3531,7 @@ export const createSeekeableAudioResource = async (
         volume,
         audioMixer,
         returnPCM,
-        returnPCM ? true : (player.loudnessNormalizer ?? enableAGC),
+        player.loudnessNormalizer ?? enableAGC,
         enableCrossfade
       )
     }
@@ -3563,7 +3567,7 @@ export const createSeekeableAudioResource = async (
       volume,
       audioMixer,
       returnPCM,
-      returnPCM ? true : (player.loudnessNormalizer ?? enableAGC),
+      player.loudnessNormalizer ?? enableAGC,
       enableCrossfade
     )
   } catch (err) {
@@ -3578,7 +3582,8 @@ export const createPCMStream = (
   type: string,
   nodelink: NodeLink,
   volume: number = 1.0,
-  filters: FiltersState = {}
+  filters: FiltersState = {},
+  enableAGC: boolean = false
 ): Transform => {
   const resamplingQuality =
     nodelink.options.playback.audio?.resamplingQuality || 'fastest'
@@ -3663,7 +3668,15 @@ export const createPCMStream = (
       throw new Error(`Unsupported audio format: '${type}'`)
   }
 
-  streams.push(new VolumeTransformer({ type: 's16le', volume }))
+  streams.push(
+    new VolumeTransformer({
+      type: 's16le',
+      volume,
+      enableAGC,
+      lookaheadMs: nodelink.options.playback.audio?.lookaheadMs,
+      gateThresholdLUFS: nodelink.options.playback.audio?.gateThresholdLUFS
+    })
+  )
   streams.push(new FiltersManager(nodelink, filters))
 
   for (const s of streams) {

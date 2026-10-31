@@ -76,6 +76,23 @@ export default class Android extends BaseClient {
   }
 
   /**
+   * Whether this client requires OAuth authentication (REQUIRED).
+   * Will check if the Oauth is configured, and return false if not.
+   */
+  override requiresOAuth(): boolean {
+    return false
+  }
+
+  /**
+   * Returns player parameters for ANDROID playback.
+   *
+   * @returns Base64-encoded player parameters string
+   */
+  override getPlayerParams(): string | null {
+    return '2AMB'
+  }
+
+  /**
    * Searches YouTube for tracks, playlists, channels, or artists.
    *
    * Extends the base class `search` with optional proxy and status reporting

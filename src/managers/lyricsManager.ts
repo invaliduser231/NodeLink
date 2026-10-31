@@ -215,6 +215,22 @@ export default class LyricsManager {
     }
   }
 
+  /* INFO: A provider that throws must not abort the search, so a throw becomes an error result like any other failure */
+  private async _fetchFrom(
+    source: LyricsSourceInstance,
+    name: string | undefined,
+    trackInfo: TrackInfoLike,
+    language?: string
+  ): Promise<LyricsLoadResult> {
+    try {
+      return await source.getLyrics(trackInfo, language)
+    } catch (e) {
+      const message = getErrorMessage(e)
+      logger('warn', 'Lyrics', `Lyrics source ${name} threw: ${message}`)
+      return { loadType: 'error', data: { message, severity: 'fault' } }
+    }
+  }
+
   async loadLyrics(
     decodedTrack: DecodedTrack | null | undefined,
     language?: string,
@@ -263,22 +279,14 @@ export default class LyricsManager {
       logger(
         'warn',
         'Lyrics',
-        `Could not re-fetch track information for ${decodedTrack.info.title}`
+        `Could not re-fetch track information for ${decodedTrack.info.title}, using the provided track information instead.`
       )
-      return {
-        loadType: 'error',
-        data: {
-          message:
-            'Could not re-fetch track information before loading lyrics.',
-          severity: 'fault'
-        }
-      }
     }
 
-    const trackInfo = getTrackInfoFromResolve(
-      reliableTrackData,
-      decodedTrack.info
-    )
+    const trackInfo =
+      reliableTrackData.loadType === 'track'
+        ? getTrackInfoFromResolve(reliableTrackData, decodedTrack.info)
+        : decodedTrack.info
 
     if (requestedSource?.trim()) {
       const requestedName = requestedSource.trim().toLowerCase()
@@ -320,6 +328,8 @@ export default class LyricsManager {
     const isYouTube = sourceName === 'youtube' || sourceName === 'ytmusic'
 
     let youtubeCaptions: LyricsLoadResult | null = null
+    let lastError: LyricsLoadResult | null = null
+    let sawEmpty = false
 
     if (lyricsSource && !skipTrackSource) {
       if (isYouTube) {
@@ -336,12 +346,21 @@ export default class LyricsManager {
           )
         }
       } else {
-        const lyrics = await lyricsSource.getLyrics(trackInfo, language)
-        if (lyrics && lyrics.loadType !== 'empty') {
-          if (lyrics.loadType === 'lyrics') {
-            lyrics.data.provider = sourceName
-          }
+        const lyrics = await this._fetchFrom(
+          lyricsSource,
+          sourceName,
+          trackInfo,
+          language
+        )
+        if (lyrics?.loadType === 'lyrics') {
+          lyrics.data.provider = sourceName
           return lyrics
+        }
+
+        if (lyrics?.loadType === 'error') {
+          lastError = lyrics
+        } else {
+          sawEmpty = true
         }
       }
     }
@@ -359,7 +378,12 @@ export default class LyricsManager {
         'Lyrics',
         `Trying lyrics source ${name} for ${trackInfo?.title || 'Unknown Title'}.`
       )
-      const lyrics = await source.getLyrics(trackInfo, language)
+      const lyrics = await this._fetchFrom(source, name, trackInfo, language)
+
+      if (lyrics?.loadType === 'error') {
+        lastError = lyrics
+        continue
+      }
 
       if (lyrics && lyrics.loadType !== 'empty') {
         if (
@@ -395,11 +419,18 @@ export default class LyricsManager {
         }
         return lyrics
       }
+
+      sawEmpty = true
     }
 
     if (isYouTube && youtubeCaptions?.loadType === 'lyrics') {
       youtubeCaptions.data.provider = sourceName
       return youtubeCaptions
+    }
+
+    /* INFO: Only report a failure when every provider that answered failed; otherwise the track simply has no lyrics */
+    if (lastError && !sawEmpty) {
+      return lastError
     }
 
     logger(
